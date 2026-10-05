@@ -67,6 +67,7 @@ def migrate():
         db.execute("INSERT INTO usage(bucket,process,proto,port,ipv,tx,rx) "
                    "SELECT bucket,process,proto,port,0,tx,rx FROM usage_old")
         db.execute("DROP TABLE usage_old")
+    db.execute("DELETE FROM connections WHERE process='unknown'")      # mislabelled by earlier versions
     if "user" not in cols("connections"):
         db.execute("ALTER TABLE connections ADD COLUMN user TEXT DEFAULT ''")
     if "last_user" not in cols("executables"):
@@ -82,6 +83,7 @@ rdns_pending = set()
 DEMO = False
 cap = None                 # capture.Capture when live capture is active
 owners = {}                # (proto, local_port) -> (process, last_seen)
+last_owner = {}            # (proto, laddr, lport, raddr, rport) -> (pid, name, exe, user, ts) while the connection was open
 listen_ports = set()       # (proto, local_port) of listening sockets
 live_rates = {}            # (process, proto, port) -> (tx_Bps, rx_Bps) over the last interval
 pending_flows = {}         # flows whose socket owner was not found yet (retried once)
@@ -129,6 +131,24 @@ def add_alert(kind, subject, detail):
 
 
 # ---------------------------------------------------------------- sampling
+def proc_info(pid):
+    """(name, exe, user) for a pid, or None if it no longer exists. Each field is looked up on its
+    own: protected/system processes often refuse exe() or username() but still give a name."""
+    try:
+        p = psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return None
+    out = []
+    for fn in (p.name, p.exe, p.username):
+        try:
+            out.append(fn() or "")
+        except psutil.NoSuchProcess:
+            return None
+        except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            out.append("")
+    return tuple(out)
+
+
 def snapshot_real():
     rows = []
     procs = {}
@@ -139,28 +159,43 @@ def snapshot_real():
     now = time.time()
     lp = set()
     for c in conns:
+        proto = "tcp" if c.type == socket.SOCK_STREAM else "udp"
         pid = c.pid or 0
-        if pid not in procs:
-            try:
-                p = psutil.Process(pid)
-                procs[pid] = (p.name(), p.exe() or "", p.username())
-            except Exception:
-                procs[pid] = ("unknown", "", "")
-        name, exe, user = procs[pid]
+        flow = (proto, c.laddr.ip, c.laddr.port, c.raddr.ip, c.raddr.port) if c.raddr else None
+        if pid and pid not in procs:
+            procs[pid] = proc_info(pid)
+        info = procs.get(pid) if pid else None
+        if info:
+            name, exe, user = info
+            name = name or f"pid {pid}"
+        else:
+            # Windows reports pid 0 for connections that are closing (TIME_WAIT etc.), and a process can
+            # exit between listing and lookup. Reuse the owner we saw while the connection was open.
+            prev = last_owner.get(flow) if flow else None
+            if prev:
+                pid, name, exe, user = prev[:4]
+            elif pid:
+                name, exe, user = "(exited)", "", ""
+            else:
+                name, exe, user = "(no owner)", "", ""
+        if pid and info:
+            if flow:
+                last_owner[flow] = (pid, name, exe, user, now)
         if c.laddr and pid:
-            k = ("tcp" if c.type == socket.SOCK_STREAM else "udp", c.laddr.port)
+            k = (proto, c.laddr.port)
             owners[k] = (name, now)
             if c.status == "LISTEN":
                 lp.add(k)
         if not c.raddr:      # skip pure listeners; they have no remote peer
             continue
-        rows.append(dict(process=name, exe=exe, pid=pid, user=user,
-                         proto="tcp" if c.type == socket.SOCK_STREAM else "udp",
+        rows.append(dict(process=name, exe=exe, pid=pid, user=user, proto=proto,
                          laddr=c.laddr.ip, lport=c.laddr.port,
                          raddr=c.raddr.ip, rport=c.raddr.port, status=c.status))
     listen_ports.clear(); listen_ports.update(lp)
     for k in [k for k, v in owners.items() if now - v[1] > OWNER_TTL]:
         del owners[k]
+    for k in [k for k, v in last_owner.items() if now - v[4] > 300]:
+        del last_owner[k]
     return rows
 
 
@@ -482,7 +517,7 @@ def sample_loop():
                                   status,first_seen,last_seen,user) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                (key, r["process"], r["exe"], r["pid"], r["proto"], r["laddr"],
                                 r["lport"], r["raddr"], r["rport"], r["status"], now, now, r.get("user", "")))
-                    if r["process"] not in seen_apps:
+                    if r["process"] not in seen_apps and not r["process"].startswith("("):
                         seen_apps.add(r["process"])
                         add_alert("new-app", r["process"], f"first network activity ({r['exe'] or 'path unknown'})")
                     if r["raddr"] not in seen_hosts and not is_private(r["raddr"]):
