@@ -35,8 +35,8 @@ def validate(d):
     warn = None
     if kind == "protocol":
         r["proto"] = d.get("proto")
-        if r["proto"] not in ("tcp", "udp", "icmp"):
-            return None, "protocol must be tcp, udp or icmp", None
+        if r["proto"] not in ("tcp", "udp", "quic", "icmp"):
+            return None, "protocol must be tcp, udp, quic or icmp", None
         if r["proto"] in ("tcp", "udp"):
             warn = f"This blocks ALL {r['proto'].upper()} traffic (except loopback) and will cut your internet access"
     elif kind == "port":
@@ -81,6 +81,8 @@ def match_path(pat, exe):
 def describe(r):
     d = {"in": "inbound", "out": "outbound", "both": "in+out"}[r["direction"]]
     if r["kind"] == "protocol":
+        if r["proto"] == "quic":
+            return f"QUIC / HTTP3 (udp 443) {d}"
         return f"all {r['proto'].upper()}{' (ping)' if r['proto'] == 'icmp' else ''} {d}"
     if r["kind"] == "port":
         return f"{'tcp+udp' if r['proto'] == 'any' else r['proto']} port {r['port']} {d}"
@@ -102,6 +104,8 @@ def render_nft(rules):
                 if r["proto"] == "icmp":
                     chain.append(f"icmp type {{ echo-request, echo-reply }} counter drop {tag}")
                     chain.append(f"icmpv6 type {{ echo-request, echo-reply }} counter drop {tag}")
+                elif r["proto"] == "quic":      # QUIC rides on UDP 443; browsers fall back to TCP/HTTP2
+                    chain.append(f"meta l4proto udp th dport 443 counter drop {tag}")
                 else:
                     chain.append(f'{iface} != "lo" meta l4proto {r["proto"]} counter drop {tag}')
             elif r["kind"] == "port":
@@ -173,6 +177,8 @@ class Enforcer:
                 if r["kind"] == "protocol":
                     if r["proto"] == "icmp":
                         ps += [f"{base} -Protocol ICMPv4 -IcmpType 8,0", f"{base} -Protocol ICMPv6 -IcmpType 128,129"]
+                    elif r["proto"] == "quic":
+                        ps.append(f"{base} -Protocol UDP {portarg} 443")
                     else:
                         ps.append(f"{base} -Protocol {r['proto'].upper()}")
                 elif r["kind"] == "port":

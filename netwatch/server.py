@@ -35,11 +35,9 @@ CREATE TABLE IF NOT EXISTS labels(
   kind TEXT, target TEXT, label TEXT DEFAULT '', color TEXT DEFAULT '',
   policy TEXT DEFAULT 'none', note TEXT DEFAULT '',
   PRIMARY KEY(kind, target));           -- kind: app | host
-CREATE TABLE IF NOT EXISTS usage(
-  bucket INTEGER, process TEXT, proto TEXT, port INTEGER,
-  tx INTEGER DEFAULT 0, rx INTEGER DEFAULT 0,
-  PRIMARY KEY(bucket, process, proto, port));   -- 1-minute buckets, service port
-CREATE INDEX IF NOT EXISTS usage_bucket ON usage(bucket);
+CREATE TABLE IF NOT EXISTS exe_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, ts REAL, user TEXT, pid INTEGER);
+CREATE INDEX IF NOT EXISTS exe_runs_path ON exe_runs(path, ts);
 CREATE TABLE IF NOT EXISTS executables(
   path TEXT PRIMARY KEY, filename TEXT, first_run REAL, last_run REAL, runs INTEGER DEFAULT 1,
   publisher TEXT DEFAULT '', signed INTEGER, verified_by TEXT DEFAULT '', sha256 TEXT DEFAULT '',
@@ -55,6 +53,29 @@ CREATE TABLE IF NOT EXISTS alerts(
   detail TEXT, ack INTEGER DEFAULT 0);
 """)
 
+def migrate():
+    """Upgrade databases created by earlier versions."""
+    cols = lambda t: {r["name"] for r in db.execute(f"PRAGMA table_info({t})")}
+    if "ipv" not in cols("usage") and cols("usage"):
+        db.executescript("ALTER TABLE usage RENAME TO usage_old; DROP INDEX IF EXISTS usage_bucket;")
+    db.executescript("""CREATE TABLE IF NOT EXISTS usage(
+      bucket INTEGER, process TEXT, proto TEXT, port INTEGER, ipv INTEGER DEFAULT 0,
+      tx INTEGER DEFAULT 0, rx INTEGER DEFAULT 0,
+      PRIMARY KEY(bucket, process, proto, port, ipv));   -- 1-minute buckets, service port, ipv 4/6 (0 = unknown)
+      CREATE INDEX IF NOT EXISTS usage_bucket ON usage(bucket);""")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='usage_old'").fetchone():
+        db.execute("INSERT INTO usage(bucket,process,proto,port,ipv,tx,rx) "
+                   "SELECT bucket,process,proto,port,0,tx,rx FROM usage_old")
+        db.execute("DROP TABLE usage_old")
+    if "user" not in cols("connections"):
+        db.execute("ALTER TABLE connections ADD COLUMN user TEXT DEFAULT ''")
+    if "last_user" not in cols("executables"):
+        db.execute("ALTER TABLE executables ADD COLUMN last_user TEXT DEFAULT ''")
+        db.execute("UPDATE executables SET last_user=user")
+    db.commit()
+
+
+migrate()
 traffic = []          # [(ts, bytes_sent_per_s, bytes_recv_per_s)]
 rdns_cache = {}       # ip -> hostname or ""
 rdns_pending = set()
@@ -122,10 +143,10 @@ def snapshot_real():
         if pid not in procs:
             try:
                 p = psutil.Process(pid)
-                procs[pid] = (p.name(), p.exe() or "")
+                procs[pid] = (p.name(), p.exe() or "", p.username())
             except Exception:
-                procs[pid] = ("unknown", "")
-        name, exe = procs[pid]
+                procs[pid] = ("unknown", "", "")
+        name, exe, user = procs[pid]
         if c.laddr and pid:
             k = ("tcp" if c.type == socket.SOCK_STREAM else "udp", c.laddr.port)
             owners[k] = (name, now)
@@ -133,7 +154,7 @@ def snapshot_real():
                 lp.add(k)
         if not c.raddr:      # skip pure listeners; they have no remote peer
             continue
-        rows.append(dict(process=name, exe=exe, pid=pid,
+        rows.append(dict(process=name, exe=exe, pid=pid, user=user,
                          proto="tcp" if c.type == socket.SOCK_STREAM else "udp",
                          laddr=c.laddr.ip, lport=c.laddr.port,
                          raddr=c.raddr.ip, rport=c.raddr.port, status=c.status))
@@ -147,7 +168,7 @@ _demo_apps = [("firefox", "/usr/bin/firefox"), ("code", "/usr/share/code/code"),
               ("curl", "/usr/bin/curl"), ("telegram", "/opt/telegram/Telegram"),
               ("unknown-miner", "/tmp/.x/kworker")]
 _demo_hosts = ["142.250.74.46", "151.101.1.69", "52.84.150.12", "185.199.108.153",
-               "93.184.216.34", "45.9.148.200", "10.0.0.5"]
+               "93.184.216.34", "45.9.148.200", "10.0.0.5", "2a00:1450:4001:81b::200e", "2606:4700::6810:84e5"]
 _demo_state = []
 
 
@@ -156,6 +177,7 @@ def snapshot_demo():
     if not _demo_state or random.random() < 0.25:
         app = random.choice(_demo_apps)
         _demo_state.append(dict(process=app[0], exe=app[1], pid=1000 + _demo_apps.index(app),
+                                user=random.choice(["alice", "alice", "root"]),
                                 proto=random.choice(["tcp", "tcp", "udp"]),
                                 laddr="192.168.1.20", lport=random.randint(40000, 60000),
                                 raddr=random.choice(_demo_hosts),
@@ -179,17 +201,17 @@ def service_port(proto, lport, rport):
 
 
 def ingest_usage(items, now, dt):
-    """items: [(process, proto, port, tx_bytes, rx_bytes)] accumulated over dt seconds."""
+    """items: [(process, proto, port, ipv, tx_bytes, rx_bytes)] accumulated over dt seconds."""
     bucket = int(now // 60) * 60
     live_rates.clear()
     with db_lock:
-        for process, proto, port, tx, rx in items:
+        for process, proto, port, ipv, tx, rx in items:
             if not (tx or rx):
                 continue
-            db.execute("""INSERT INTO usage(bucket,process,proto,port,tx,rx) VALUES(?,?,?,?,?,?)
-                          ON CONFLICT(bucket,process,proto,port) DO UPDATE SET tx=tx+excluded.tx, rx=rx+excluded.rx""",
-                       (bucket, process, proto, port, int(tx), int(rx)))
-            k = (process, proto, port)
+            db.execute("""INSERT INTO usage(bucket,process,proto,port,ipv,tx,rx) VALUES(?,?,?,?,?,?,?)
+                          ON CONFLICT(bucket,process,proto,port,ipv) DO UPDATE SET tx=tx+excluded.tx, rx=rx+excluded.rx""",
+                       (bucket, process, proto, port, ipv, int(tx), int(rx)))
+            k = (process, "quic" if proto == "udp" and port == 443 else proto, port)
             t0, r0 = live_rates.get(k, (0, 0))
             live_rates[k] = (t0 + tx / dt, r0 + rx / dt)
         db.commit()
@@ -207,10 +229,10 @@ def drain_capture(now, dt):
                 retry[(proto, lport, raddr, rport)] = [tx, rx]
                 continue
         name = owner[0] if owner else UNATTRIBUTED
-        k = (name, proto, service_port(proto, lport, rport))
+        k = (name, proto, service_port(proto, lport, rport), 6 if ":" in raddr else 4)
         a = agg.setdefault(k, [0, 0]); a[0] += tx; a[1] += rx
     pending_flows.clear(); pending_flows.update(retry)
-    ingest_usage([(n, p, port, t, r) for (n, p, port), (t, r) in agg.items()], now, dt)
+    ingest_usage([(n, p, port, v, t, r) for (n, p, port, v), (t, r) in agg.items()], now, dt)
 
 
 def demo_usage(rows, now, dt):
@@ -219,7 +241,7 @@ def demo_usage(rows, now, dt):
         heavy = r["process"] in ("firefox", "unknown-miner")
         rx = random.randint(2_000, 400_000 if heavy else 40_000) * dt
         tx = random.randint(500, 60_000 if heavy else 8_000) * dt
-        items.append((r["process"], r["proto"], r["rport"], tx, rx))
+        items.append((r["process"], r["proto"], r["rport"], 6 if ":" in r["raddr"] else 4, tx, rx))
     ingest_usage(items, now, dt)
 
 
@@ -253,31 +275,34 @@ def scan_processes(now):
         key = (p.info["pid"], p.info["create_time"])
         live.add(key)
         if key not in exe_live:
-            new.append((exe, p.info["create_time"], p.info.get("username") or ""))
+            new.append((exe, p.info["create_time"], p.info.get("username") or "", p.info["pid"]))
     exe_live = live
     if not new:
         return
     with db_lock:
-        for exe, started, user in new:
+        for exe, started, user, pid in new:
             try:
                 st = os.stat(exe[:-10] if exe.endswith(" (deleted)") else exe)
                 mtime = st.st_mtime
             except OSError:
                 mtime = None
             row = db.execute("SELECT mtime FROM executables WHERE path=?", (exe,)).fetchone()
+            db.execute("INSERT INTO exe_runs(path,ts,user,pid) VALUES(?,?,?,?)", (exe, started, user, pid))
             if row is None:
-                db.execute("""INSERT INTO executables(path,filename,first_run,last_run,user,baseline,risky,mtime)
-                              VALUES(?,?,?,?,?,?,?,?)""",
-                           (exe, _split_name(exe), started, started, user, int(first_scan),
+                db.execute("""INSERT INTO executables(path,filename,first_run,last_run,user,last_user,baseline,risky,mtime)
+                              VALUES(?,?,?,?,?,?,?,?,?)""",
+                           (exe, _split_name(exe), started, started, user, user, int(first_scan),
                             int(bool(RISKY_RE.search(exe))), mtime))
                 if not first_scan:
                     add_alert("new-exe", _split_name(exe), f"first run from {exe}")
                 verifier.submit(exe)
             else:
                 changed = mtime is not None and row["mtime"] is not None and abs(mtime - row["mtime"]) > 1
-                db.execute("UPDATE executables SET last_run=MAX(last_run,?), first_run=MIN(first_run,?), runs=runs+1, "
+                db.execute("UPDATE executables SET user=CASE WHEN ?<first_run THEN ? ELSE user END, "
+                           "last_user=CASE WHEN ?>=last_run THEN ? ELSE last_user END, "
+                           "last_run=MAX(last_run,?), first_run=MIN(first_run,?), runs=runs+1, "
                            "mtime=COALESCE(?,mtime), modified=modified OR ? WHERE path=?",
-                           (started, started, mtime, int(changed), exe))
+                           (started, user, started, user, started, started, mtime, int(changed), exe))
                 if changed:
                     db.execute("UPDATE executables SET status='pending' WHERE path=?", (exe,))
                     add_alert("exe-modified", _split_name(exe), f"file changed on disk since first run: {exe}")
@@ -302,24 +327,32 @@ def q_executables(params):
     if p("baseline") == "0":
         where.append("baseline=0")
     if p("q"):
-        where.append("(filename LIKE ? OR path LIKE ? OR publisher LIKE ? OR sha256 LIKE ? OR user LIKE ?)")
-        args += [f"%{p('q')}%"] * 5
-    sort = p("sort") if p("sort") in ("filename", "path", "first_run", "last_run", "runs", "publisher", "signed", "user") else "first_run"
+        where.append("(filename LIKE ? OR path LIKE ? OR publisher LIKE ? OR sha256 LIKE ? OR user LIKE ? OR last_user LIKE ?)")
+        args += [f"%{p('q')}%"] * 6
+    sort = p("sort") if p("sort") in ("filename", "path", "first_run", "last_run", "runs", "publisher", "signed", "user", "last_user") else "first_run"
     order = "ASC" if p("dir") == "asc" else "DESC"
     with db_lock:
         return [dict(r) for r in db.execute(
             f"SELECT * FROM executables {'WHERE ' + ' AND '.join(where) if where else ''} ORDER BY {sort} {order} LIMIT 2000", args)]
 
 
+def q_exe_runs(params):
+    path = (params.get("path") or [""])[0]
+    with db_lock:
+        return [dict(r) for r in db.execute(
+            "SELECT ts, user, pid FROM exe_runs WHERE path=? ORDER BY ts DESC LIMIT 200", (path,))]
+
+
 def executables_csv(params):
     import csv, io
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["filename", "path", "first_run", "publisher", "signed", "verified_by", "sha256", "runs", "last_run", "user"])
+    w.writerow(["filename", "path", "first_run", "publisher", "signed", "verified_by", "sha256", "runs", "last_run", "first_run_by", "last_run_by"])
     for r in q_executables(params):
         w.writerow([r["filename"], r["path"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["first_run"])),
                     r["publisher"], {1: "yes", 0: "no"}.get(r["signed"], "pending"), r["verified_by"],
-                    r["sha256"], r["runs"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["last_run"])), r["user"]])
+                    r["sha256"], r["runs"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["last_run"])),
+                    r["user"], r["last_user"]])
     return buf.getvalue()
 
 
@@ -431,6 +464,7 @@ def sample_loop():
             last_prune = now
             with db_lock:
                 db.execute("DELETE FROM usage WHERE bucket < ?", (now - USAGE_KEEP_DAYS * 86400,))
+                db.execute("DELETE FROM exe_runs WHERE ts < ?", (now - 90 * 86400,))
                 db.commit()
         with db_lock:
             keys = set()
@@ -445,9 +479,9 @@ def sample_loop():
                                (now, r["status"], key))
                 else:
                     db.execute("""INSERT INTO connections(key,process,exe,pid,proto,laddr,lport,raddr,rport,
-                                  status,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  status,first_seen,last_seen,user) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                (key, r["process"], r["exe"], r["pid"], r["proto"], r["laddr"],
-                                r["lport"], r["raddr"], r["rport"], r["status"], now, now))
+                                r["lport"], r["raddr"], r["rport"], r["status"], now, now, r.get("user", "")))
                     if r["process"] not in seen_apps:
                         seen_apps.add(r["process"])
                         add_alert("new-app", r["process"], f"first network activity ({r['exe'] or 'path unknown'})")
@@ -486,13 +520,23 @@ def q_connections(params):
     p = lambda k: (params.get(k) or [""])[0]
     if p("active") == "1":
         where.append("c.active=1")
-    if p("proto"):
+    if p("proto") == "quic":                     # QUIC / HTTP3 = UDP to port 443
+        where.append("c.proto='udp' AND c.rport=443")
+    elif p("proto") == "udp":
+        where.append("c.proto='udp' AND c.rport!=443")
+    elif p("proto"):
         where.append("c.proto=?"); args.append(p("proto"))
+    if p("ipv") in ("4", "6"):
+        where.append("c.raddr %s LIKE '%%:%%'" % ("" if p("ipv") == "6" else "NOT"))
     if p("process"):
         where.append("c.process=?"); args.append(p("process"))
+    if p("user"):
+        where.append("c.user=?"); args.append(p("user"))
     if p("remote") == "public":
         where.append("c.raddr NOT LIKE '10.%' AND c.raddr NOT LIKE '192.168.%' AND c.raddr NOT LIKE '127.%' "
-                     "AND c.raddr NOT LIKE '172.16.%' AND c.raddr!='::1'")
+                     "AND c.raddr NOT LIKE '172.16.%' AND c.raddr NOT LIKE '172.2_.%' AND c.raddr NOT LIKE '172.30.%' "
+                     "AND c.raddr NOT LIKE '172.31.%' AND c.raddr NOT LIKE '169.254.%' AND c.raddr!='::1' "
+                     "AND c.raddr NOT LIKE 'fe80:%' AND c.raddr NOT LIKE 'fc%:%' AND c.raddr NOT LIKE 'fd%:%'")
     if p("label") == "labelled":
         where.append("(a.label!='' OR h.label!='')")
     elif p("label") == "unlabelled":
@@ -504,10 +548,10 @@ def q_connections(params):
     if p("q"):
         like = f"%{p('q')}%"
         where.append("(c.process LIKE ? OR c.raddr LIKE ? OR CAST(c.rport AS TEXT) LIKE ? OR c.exe LIKE ? "
-                     "OR a.label LIKE ? OR h.label LIKE ? OR a.note LIKE ? OR h.note LIKE ?)")
-        args += [like] * 8
+                     "OR a.label LIKE ? OR h.label LIKE ? OR a.note LIKE ? OR h.note LIKE ? OR c.user LIKE ?)")
+        args += [like] * 9
     sort = p("sort") if p("sort") in ("process", "pid", "proto", "raddr", "rport", "status",
-                                      "first_seen", "last_seen", "hits") else "last_seen"
+                                      "first_seen", "last_seen", "hits", "user") else "last_seen"
     order = "ASC" if p("dir") == "asc" else "DESC"
     sql = f"""SELECT c.*, COALESCE(a.label,'') AS app_label, COALESCE(a.color,'') AS app_color,
                      COALESCE(a.policy,'none') AS app_policy,
@@ -522,6 +566,8 @@ def q_connections(params):
         out = [dict(r) for r in db.execute(sql, args)]
     for r in out:
         r["hostname"] = rdns_cache.get(r["raddr"], "")
+        r["ipv"] = 6 if ":" in r["raddr"] else 4
+        r["proto_label"] = "quic" if r["proto"] == "udp" and r["rport"] == 443 else r["proto"]
     return out
 
 
@@ -551,50 +597,66 @@ def svc_name(proto, port):
         return ""
 
 
-def q_usage(params):
-    p = lambda k, d="": (params.get(k) or [d])[0]
-    try:
-        rng = max(60, min(int(p("range", "3600")), USAGE_KEEP_DAYS * 86400))
-    except ValueError:
-        rng = 3600
-    group = {"app": ["process"], "app_port": ["process", "proto", "port"],
-             "port": ["proto", "port"], "proto": ["proto"]}.get(p("group", "app_port"), ["process", "proto", "port"])
+USAGE_SRC = """(SELECT bucket, process, port, ipv, tx, rx,
+                       CASE WHEN proto='udp' AND port=443 THEN 'quic' ELSE proto END AS proto FROM usage) u"""
+
+
+def usage_filters(p, rng):
+    """Shared by the usage table and chart. proto: tcp | udp (non-QUIC) | quic | icmp."""
     where, args = ["bucket >= ?"], [time.time() - rng]
     if p("proto"):
         where.append("proto=?"); args.append(p("proto"))
+    if p("ipv") in ("4", "6"):
+        where.append("ipv=?"); args.append(int(p("ipv")))
     if p("process"):
         where.append("process=?"); args.append(p("process"))
     if p("q"):
         where.append("(process LIKE ? OR CAST(port AS TEXT) LIKE ? OR proto LIKE ?)"); args += [f"%{p('q')}%"] * 3
+    return where, args
+
+
+def _range(p):
+    try:
+        return max(60, min(int(p("range", "3600")), USAGE_KEEP_DAYS * 86400))
+    except ValueError:
+        return 3600
+
+
+def q_usage(params):
+    p = lambda k, d="": (params.get(k) or [d])[0]
+    rng = _range(p)
+    group = {"app": ["process"], "app_port": ["process", "proto", "port"],
+             "port": ["proto", "port"], "proto": ["proto"]}.get(p("group", "app_port"), ["process", "proto", "port"])
+    where, args = usage_filters(p, rng)
     sort = p("sort", "total") if p("sort", "total") in ("process", "proto", "port", "tx", "rx", "total") else "total"
     if sort in ("process", "proto", "port") and sort not in group:
         sort = "total"
     order = "ASC" if p("dir") == "asc" else "DESC"
     sql = f"""SELECT {', '.join(group)}, SUM(tx) AS tx, SUM(rx) AS rx, SUM(tx)+SUM(rx) AS total
-              FROM usage WHERE {' AND '.join(where)} GROUP BY {', '.join(group)}
+              FROM {USAGE_SRC} WHERE {' AND '.join(where)} GROUP BY {', '.join(group)}
               ORDER BY {sort} {order} LIMIT 500"""
     with db_lock:
         rows = [dict(r) for r in db.execute(sql, args)]
     for r in rows:
         if "port" in r:
-            r["service"] = svc_name(r["proto"], r["port"])
+            r["service"] = "https (HTTP/3)" if r["proto"] == "quic" else svc_name(r["proto"], r["port"])
     return rows
 
 
 def q_usage_series(params):
     p = lambda k, d="": (params.get(k) or [d])[0]
+    rng = _range(p)
     try:
-        rng = max(60, min(int(p("range", "3600")), USAGE_KEEP_DAYS * 86400))
         top = max(1, min(int(p("top", "6")), 12))
     except ValueError:
-        rng, top = 3600, 6
-    since = time.time() - rng
+        top = 6
+    where, args = usage_filters(p, rng)
     step = 60 if rng <= 7200 else 600 if rng <= 86400 * 2 else 3600
     with db_lock:
         tops = [r["process"] for r in db.execute(
-            "SELECT process FROM usage WHERE bucket>=? GROUP BY process ORDER BY SUM(tx+rx) DESC LIMIT ?", (since, top))]
-        rows = db.execute("SELECT (bucket/?)*? AS b, process, SUM(tx+rx) AS n FROM usage WHERE bucket>=? GROUP BY b, process",
-                          (step, step, since)).fetchall()
+            f"SELECT process FROM {USAGE_SRC} WHERE {' AND '.join(where)} GROUP BY process ORDER BY SUM(tx+rx) DESC LIMIT ?", args + [top])]
+        rows = db.execute(f"SELECT (bucket/?)*? AS b, process, SUM(tx+rx) AS n FROM {USAGE_SRC} WHERE {' AND '.join(where)} GROUP BY b, process",
+                          [step, step] + args).fetchall()
     series = {}
     for r in rows:
         name = r["process"] if r["process"] in tops else "other"
@@ -608,7 +670,7 @@ def q_usage_live():
     for (proc, proto, port), (tx, rx) in list(live_rates.items()):
         a = out.setdefault(proc, {"process": proc, "tx": 0, "rx": 0, "ports": {}})
         a["tx"] += tx; a["rx"] += rx
-        a["ports"][f"{proto}/{port}"] = a["ports"].get(f"{proto}/{port}", 0) + tx + rx
+        a["ports"][f"{proto}/{port}" if proto != "icmp" else "icmp"] = a["ports"].get(f"{proto}/{port}" if proto != "icmp" else "icmp", 0) + tx + rx
     res = sorted(out.values(), key=lambda a: -(a["tx"] + a["rx"]))
     for a in res:
         a["ports"] = [k for k, _ in sorted(a["ports"].items(), key=lambda kv: -kv[1])[:4]]
@@ -653,6 +715,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/labels": return self.send_json(q_labels())
         if u.path == "/api/alerts": return self.send_json(q_alerts(params))
         if u.path == "/api/executables": return self.send_json(q_executables(params))
+        if u.path == "/api/executables/runs": return self.send_json(q_exe_runs(params))
         if u.path == "/api/executables.csv":
             data = executables_csv(params).encode()
             self.send_response(200)
