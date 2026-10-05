@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetWatch</title>
+<style>
+:root{--bg:#0f1419;--panel:#171d25;--line:#263040;--txt:#d8dee9;--mut:#7d8aa0;--acc:#4fa3ff;--ok:#3ecf8e;--warn:#f5a623;--bad:#ff5d5d}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6f9;--panel:#fff;--line:#dde3ec;--txt:#1d2733;--mut:#6a778b;--acc:#1f7ae0}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;gap:16px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+h1{font-size:16px;margin:0}nav{display:flex;gap:4px}
+nav button{background:none;border:0;color:var(--mut);padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit}
+nav button.on{background:var(--bg);color:var(--txt)}
+.badge{background:var(--bad);color:#fff;border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
+main{padding:16px;max-width:1500px;margin:auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:14px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+input,select,button.b{background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
+input[type=search]{min-width:220px}
+button.b{cursor:pointer}button.b:hover{border-color:var(--acc)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+th{color:var(--mut);font-weight:600;cursor:pointer;user-select:none;position:sticky;top:0;background:var(--panel)}
+th.s::after{content:attr(data-d);color:var(--acc)}
+tr:hover td{background:rgba(79,163,255,.06)}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff;background:#556;margin-right:4px}
+.pol-block{color:var(--bad)}.pol-trusted{color:var(--ok)}.pol-watch{color:var(--warn)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mut);margin-right:6px}.dot.on{background:var(--ok)}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.mut{color:var(--mut)}.stats{display:flex;gap:24px}.stats b{font-size:18px;display:block}
+canvas{width:100%;height:170px;display:block}
+dialog{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:10px;min-width:340px}
+dialog label{display:block;margin:8px 0 2px;color:var(--mut);font-size:12px}dialog input,dialog select{width:100%}
+.scroll{overflow:auto;max-height:62vh}
+.empty{padding:30px;text-align:center;color:var(--mut)}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛡 NetWatch</h1>
+  <nav id="nav"></nav>
+  <span class="mut" id="clock" style="margin-left:auto"></span>
+</header>
+<main>
+  <div class="card stats" id="stats"></div>
+  <div class="card"><canvas id="graph"></canvas></div>
+  <div id="view"></div>
+</main>
+
+<dialog id="dlg"><form method="dialog" id="frm">
+  <h3 id="dtitle" style="margin-top:0"></h3>
+  <label>Label</label><input id="d_label" placeholder="e.g. Browser, Work VPN, Suspicious">
+  <label>Colour</label><input id="d_color" type="color" value="#4fa3ff">
+  <label>Policy (advisory flag; raises an alert on new connections when "block")</label>
+  <select id="d_policy"><option value="none">none</option><option value="trusted">trusted</option><option value="watch">watch</option><option value="block">block</option></select>
+  <label>Note</label><input id="d_note">
+  <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="b" type="button" id="d_del">Remove label</button>
+    <button class="b" value="cancel">Cancel</button><button class="b" id="d_ok" value="ok">Save</button>
+  </div></form></dialog>
+
+<script>
+const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ago=t=>{const s=Math.max(0,Date.now()/1000-t);return s<60?Math.floor(s)+'s ago':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago'};
+const hb=n=>n>=1e6?(n/1e6).toFixed(1)+' MB/s':n>=1e3?(n/1e3).toFixed(1)+' KB/s':n+' B/s';
+let tab='connections', F={q:'',proto:'',active:'1',remote:'',label:'',policy:'',process:''}, S={sort:'last_seen',dir:'desc'};
+let labels=[], alerts=[], traffic=[];
+const tabs=[['connections','Connections'],['apps','Apps'],['alerts','Alerts'],['labels','Labels']];
+
+function renderNav(){const un=alerts.filter(a=>!a.ack).length;
+ $('#nav').innerHTML=tabs.map(([k,n])=>`<button class="${k==tab?'on':''}" data-t="${k}">${n}${k=='alerts'&&un?`<span class="badge">${un}</span>`:''}</button>`).join('');
+ $('#nav').querySelectorAll('button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;draw()});}
+
+const qs=o=>Object.entries(o).filter(([,v])=>v!=='').map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+const api=async(p,opt)=>(await fetch(p,opt)).json();
+const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+
+function lt(l,c,p){return (l?`<span class="tag" style="background:${esc(c||'#556')}">${esc(l)}</span>`:'')+(p&&p!='none'?`<span class="pol-${p}">${p}</span>`:'')}
+
+function openLabel(kind,target,cur={}){
+ $('#dtitle').textContent=`Label ${kind}: ${target}`;
+ $('#d_label').value=cur.label||'';$('#d_color').value=cur.color||'#4fa3ff';
+ $('#d_policy').value=cur.policy||'none';$('#d_note').value=cur.note||'';
+ $('#d_ok').onclick=async e=>{e.preventDefault();await post('/api/labels',{kind,target,label:$('#d_label').value,color:$('#d_color').value,policy:$('#d_policy').value,note:$('#d_note').value});$('#dlg').close();refresh()};
+ $('#d_del').onclick=async()=>{await api(`/api/labels?${qs({kind,target})}`,{method:'DELETE'});$('#dlg').close();refresh()};
+ $('#dlg').showModal();}
+const findLabel=(k,t)=>labels.find(l=>l.kind==k&&l.target==t)||{};
+
+function th(cols){return '<tr>'+cols.map(([k,n])=>`<th data-k="${k||''}" class="${S.sort==k?'s':''}" data-d="${S.dir=='asc'?' ▲':' ▼'}">${n}</th>`).join('')+'</tr>'}
+function bindSort(){document.querySelectorAll('th[data-k]').forEach(h=>{if(!h.dataset.k)return;h.onclick=()=>{S=S.sort==h.dataset.k?{sort:S.sort,dir:S.dir=='asc'?'desc':'asc'}:{sort:h.dataset.k,dir:'desc'};refresh()}})}
+
+async function drawConnections(){
+ const rows=await api('/api/connections?'+qs({...F,...S}));
+ const labelNames=[...new Set(labels.map(l=>l.label).filter(Boolean))];
+ $('#view').innerHTML=`<div class="card">
+  <div class="bar">
+   <input type="search" id="f_q" placeholder="Search app, IP, port, label, note…" value="${esc(F.q)}">
+   <select id="f_active"><option value="1">Active now</option><option value="">All history</option></select>
+   <select id="f_proto"><option value="">tcp+udp</option><option>tcp</option><option>udp</option></select>
+   <select id="f_remote"><option value="">all remotes</option><option value="public">public only</option></select>
+   <select id="f_label"><option value="">any label</option><option value="labelled">labelled</option><option value="unlabelled">unlabelled</option>${labelNames.map(n=>`<option>${esc(n)}</option>`).join('')}</select>
+   <select id="f_policy"><option value="">any policy</option><option>trusted</option><option>watch</option><option>block</option></select>
+   <button class="b" id="exp">Export JSON</button><span class="mut">${rows.length} rows</span>
+  </div>
+  <div class="scroll"><table>${th([['process','App'],['pid','PID'],['proto','Proto'],['raddr','Remote'],['rport','Port'],['status','State'],['first_seen','First seen'],['last_seen','Last seen'],['hits','Hits'],[null,'Labels']])}
+  ${rows.map(r=>`<tr><td><span class="dot ${r.active?'on':''}"></span><a href="#" data-lab="app|${esc(r.process)}">${esc(r.process)}</a></td><td>${r.pid}</td><td>${r.proto}</td>
+   <td title="${esc(r.hostname)}"><a href="#" data-lab="host|${esc(r.raddr)}">${esc(r.raddr)}</a> <span class="mut">${esc(r.hostname)}</span></td>
+   <td>${r.rport}</td><td>${esc(r.status)}</td><td>${ago(r.first_seen)}</td><td>${ago(r.last_seen)}</td><td>${r.hits}</td>
+   <td>${lt(r.app_label,r.app_color,r.app_policy)}${lt(r.host_label,r.host_color,r.host_policy)}</td></tr>`).join('')||'<tr><td colspan=10 class="empty">No connections match.</td></tr>'}</table></div></div>`;
+ for(const k of ['active','proto','remote','label','policy'])$('#f_'+k).value=F[k];
+ const q=$('#f_q');q.oninput=()=>{F.q=q.value;clearTimeout(window._t);window._t=setTimeout(refresh,250)};
+ for(const k of ['active','proto','remote','label','policy'])$('#f_'+k).onchange=e=>{F[k]=e.target.value;refresh()};
+ $('#exp').onclick=()=>window.open('/api/export?'+qs({...F,...S}));
+ bindSort();bindLabelLinks();}
+
+function bindLabelLinks(){document.querySelectorAll('[data-lab]').forEach(a=>a.onclick=e=>{e.preventDefault();const[k,t]=a.dataset.lab.split('|');openLabel(k,t,findLabel(k,t))})}
+
+async function drawApps(){
+ const rows=await api('/api/apps');
+ $('#view').innerHTML=`<div class="card"><div class="scroll"><table>
+ <tr><th>App</th><th>Path</th><th>Active</th><th>Total conns</th><th>Remote hosts</th><th>First seen</th><th>Last seen</th><th>Label / policy</th><th></th></tr>
+ ${rows.map(r=>`<tr><td><span class="dot ${r.active?'on':''}"></span>${esc(r.process)}</td><td title="${esc(r.exe)}" class="mut">${esc(r.exe)}</td><td>${r.active}</td><td>${r.conns}</td><td>${r.hosts}</td><td>${ago(r.first_seen)}</td><td>${ago(r.last_seen)}</td>
+ <td>${lt(r.label,r.color,r.policy)} <span class="mut">${esc(r.note)}</span></td>
+ <td><button class="b" data-lab="app|${esc(r.process)}">Label</button> <button class="b" data-flt="${esc(r.process)}">Connections</button></td></tr>`).join('')||'<tr><td colspan=9 class="empty">Nothing seen yet.</td></tr>'}</table></div></div>`;
+ document.querySelectorAll('[data-flt]').forEach(b=>b.onclick=()=>{F={q:'',proto:'',active:'',remote:'',label:'',policy:'',process:b.dataset.flt};tab='connections';draw()});
+ bindLabelLinks();}
+
+function drawAlerts(){
+ $('#view').innerHTML=`<div class="card"><div class="bar"><button class="b" id="ackall">Mark all read</button></div><div class="scroll"><table>
+ <tr><th>When</th><th>Type</th><th>Subject</th><th>Detail</th></tr>
+ ${alerts.map(a=>`<tr style="${a.ack?'opacity:.55':''}"><td>${ago(a.ts)}</td><td><span class="tag" style="background:${a.kind=='blocked-attempt'?'var(--bad)':a.kind=='new-app'?'var(--warn)':'var(--acc)'}">${a.kind}</span></td><td>${esc(a.subject)}</td><td class="mut">${esc(a.detail)}</td></tr>`).join('')||'<tr><td colspan=4 class="empty">No alerts.</td></tr>'}</table></div></div>`;
+ $('#ackall').onclick=async()=>{await post('/api/alerts/ack',{id:0});refresh()};}
+
+function drawLabels(){
+ $('#view').innerHTML=`<div class="card"><div class="scroll"><table><tr><th>Kind</th><th>Target</th><th>Label</th><th>Policy</th><th>Note</th><th></th></tr>
+ ${labels.map(l=>`<tr><td>${l.kind}</td><td>${esc(l.target)}</td><td>${lt(l.label,l.color,'')}</td><td class="pol-${l.policy}">${l.policy}</td><td class="mut">${esc(l.note)}</td><td><button class="b" data-lab="${l.kind}|${esc(l.target)}">Edit</button></td></tr>`).join('')||'<tr><td colspan=6 class="empty">No labels yet — click an app or remote address on the Connections tab.</td></tr>'}</table></div></div>`;
+ bindLabelLinks();}
+
+function drawGraph(){
+ const c=$('#graph'),dpr=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;
+ const g=c.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,w,h);
+ const cs=getComputedStyle(document.body);
+ if(traffic.length<2){g.fillStyle=cs.getPropertyValue('--mut');g.fillText('collecting traffic…',10,20);return}
+ const max=Math.max(1000,...traffic.map(t=>Math.max(t[1],t[2])))*1.1,t0=traffic[0][0],t1=traffic[traffic.length-1][0];
+ const X=t=>(t-t0)/Math.max(1,t1-t0)*(w-60)+50, Y=v=>h-18-(v/max)*(h-30);
+ g.strokeStyle=cs.getPropertyValue('--line');g.fillStyle=cs.getPropertyValue('--mut');g.font='11px system-ui';
+ for(let i=0;i<=3;i++){const v=max*i/3;g.beginPath();g.moveTo(50,Y(v));g.lineTo(w-10,Y(v));g.stroke();g.fillText(hb(Math.round(v)),2,Y(v)+3)}
+ for(const[i,col]of[[2,'#4fa3ff'],[1,'#f5a623']]){g.beginPath();g.moveTo(X(t0),Y(0));traffic.forEach(t=>g.lineTo(X(t[0]),Y(t[i])));g.lineTo(X(t1),Y(0));g.closePath();
+  g.fillStyle=col+'33';g.fill();g.strokeStyle=col;g.beginPath();traffic.forEach((t,k)=>k?g.lineTo(X(t[0]),Y(t[i])):g.moveTo(X(t[0]),Y(t[i])));g.stroke()}
+ g.fillStyle='#4fa3ff';g.fillText('● download',60,10);g.fillStyle='#f5a623';g.fillText('● upload',140,10);}
+
+function draw(){renderNav();({connections:drawConnections,apps:drawApps,alerts:drawAlerts,labels:drawLabels})[tab]()}
+let busy=false;
+async function refresh(){
+ if(busy||$('#dlg').open||document.activeElement?.id=='f_q'&&false)return;busy=true;
+ try{[labels,alerts,traffic]=await Promise.all([api('/api/labels'),api('/api/alerts'),api('/api/traffic')]);
+  const last=traffic[traffic.length-1]||[0,0,0];
+  const apps=await api('/api/apps');
+  $('#stats').innerHTML=`<div><b>${hb(last[2])}</b><span class="mut">download</span></div><div><b>${hb(last[1])}</b><span class="mut">upload</span></div><div><b>${apps.reduce((a,r)=>a+(r.active||0),0)}</b><span class="mut">active connections</span></div><div><b>${apps.length}</b><span class="mut">apps seen</span></div><div><b>${alerts.filter(a=>!a.ack).length}</b><span class="mut">unread alerts</span></div>`;
+  $('#clock').textContent=new Date().toLocaleTimeString();
+  drawGraph();
+  const keep=document.activeElement?.id=='f_q'?[$('#f_q').selectionStart]:null;
+  await Promise.resolve(({connections:drawConnections,apps:drawApps,alerts:drawAlerts,labels:drawLabels})[tab]());renderNav();
+  if(keep){const q=$('#f_q');q.focus();q.setSelectionRange(keep[0],keep[0])}
+ }finally{busy=false}}
+refresh();setInterval(refresh,3000);addEventListener('resize',drawGraph);
+</script>
+</body></html>
