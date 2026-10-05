@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetWatch</title>
+<style>
+:root{--bg:#0f1419;--panel:#171d25;--line:#263040;--txt:#d8dee9;--mut:#7d8aa0;--acc:#4fa3ff;--ok:#3ecf8e;--warn:#f5a623;--bad:#ff5d5d}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6f9;--panel:#fff;--line:#dde3ec;--txt:#1d2733;--mut:#6a778b;--acc:#1f7ae0}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;gap:16px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+h1{font-size:16px;margin:0}nav{display:flex;gap:4px}
+nav button{background:none;border:0;color:var(--mut);padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit}
+nav button.on{background:var(--bg);color:var(--txt)}
+.badge{background:var(--bad);color:#fff;border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
+main{padding:16px;max-width:1500px;margin:auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:14px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+input,select,button.b{background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
+input[type=search]{min-width:220px}
+button.b{cursor:pointer}button.b:hover{border-color:var(--acc)}
+table{width:100%;border-collapse:collapse}
+table.rs{table-layout:fixed;min-width:100%}table.rs th,table.rs td{max-width:none}th{position:relative}
+.rh{position:absolute;right:0;top:0;bottom:0;width:9px;cursor:col-resize;touch-action:none}.rh:hover,.rh.on{background:linear-gradient(90deg,transparent 4px,var(--acc) 4px,var(--acc) 6px,transparent 6px)}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+th{color:var(--mut);font-weight:600;cursor:pointer;user-select:none;position:sticky;top:0;background:var(--panel)}
+th.s::after{content:attr(data-d);color:var(--acc)}
+tr:hover td{background:rgba(79,163,255,.06)}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff;background:#556;margin-right:4px}
+.pol-block{color:var(--bad)}.pol-trusted{color:var(--ok)}.pol-watch{color:var(--warn)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mut);margin-right:6px}.dot.on{background:var(--ok)}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.mut{color:var(--mut)}.stats{display:flex;gap:24px}.stats b{font-size:18px;display:block}
+canvas{width:100%;height:170px;display:block}
+dialog{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:10px;min-width:340px}
+dialog label{display:block;margin:8px 0 2px;color:var(--mut);font-size:12px}dialog input,dialog select{width:100%}
+.scroll{overflow:auto;max-height:62vh}
+.empty{padding:30px;text-align:center;color:var(--mut)}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛡 NetWatch</h1>
+  <nav id="nav"></nav>
+  <span class="mut" id="clock" style="margin-left:auto"></span>
+</header>
+<main>
+  <div class="card stats" id="stats"></div>
+  <div class="card"><canvas id="graph"></canvas></div>
+  <div id="view"></div>
+</main>
+
+<dialog id="rdlg"><form method="dialog"><h3 style="margin-top:0">Run history</h3><div class="mut" id="rtitle" style="word-break:break-all;margin-bottom:8px"></div>
+  <div class="scroll" style="max-height:50vh"><table><tr><th>Started</th><th>User</th><th>PID</th></tr><tbody id="rbody"></tbody></table></div>
+  <div class="mut" style="margin-top:6px">Observed while NetWatch was running (newest 200).</div>
+  <div style="margin-top:10px;text-align:right"><button class="b">Close</button></div></form></dialog>
+<dialog id="dlg"><form method="dialog" id="frm">
+  <h3 id="dtitle" style="margin-top:0"></h3>
+  <label>Label</label><input id="d_label" placeholder="e.g. Browser, Work VPN, Suspicious">
+  <label>Colour</label><input id="d_color" type="color" value="#4fa3ff">
+  <label>Policy (advisory flag; raises an alert on new connections when "block")</label>
+  <select id="d_policy"><option value="none">none</option><option value="trusted">trusted</option><option value="watch">watch</option><option value="block">block</option></select>
+  <label>Note</label><input id="d_note">
+  <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="b" type="button" id="d_del">Remove label</button>
+    <button class="b" value="cancel">Cancel</button><button class="b" id="d_ok" value="ok">Save</button>
+  </div></form></dialog>
+
+<script>
+const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ago=t=>{const s=Math.max(0,Date.now()/1000-t);return s<60?Math.floor(s)+'s ago':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago'};
+const hb=n=>n>=1e6?(n/1e6).toFixed(1)+' MB/s':n>=1e3?(n/1e3).toFixed(1)+' KB/s':n+' B/s';
+let tab='connections', F={q:'',proto:'',ipv:'',active:'1',remote:'',label:'',policy:'',process:'',user:''}, S={sort:'last_seen',dir:'desc'}, L={q:'',signed:'',since:'',risky:'',baseline:'',sort:'first_run',dir:'desc'}, PRE=null, U={range:3600,group:'app_port',sort:'total',dir:'desc',q:'',proto:'',ipv:''};
+let labels=[], alerts=[], traffic=[];
+const tabs=[['connections','Connections'],['usage','Usage'],['log','Log analysis'],['protect','Net protect'],['apps','Apps'],['alerts','Alerts'],['labels','Labels']];
+
+function renderNav(){const un=alerts.filter(a=>!a.ack).length;
+ $('#nav').innerHTML=tabs.map(([k,n])=>`<button class="${k==tab?'on':''}" data-t="${k}">${n}${k=='alerts'&&un?`<span class="badge">${un}</span>`:''}</button>`).join('');
+ $('#nav').querySelectorAll('button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;draw()});}
+
+const qs=o=>Object.entries(o).filter(([,v])=>v!=='').map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+const api=async(p,opt)=>(await fetch(p,opt)).json();
+const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+
+function lt(l,c,p){return (l?`<span class="tag" style="background:${esc(c||'#556')}">${esc(l)}</span>`:'')+(p&&p!='none'?`<span class="pol-${p}">${p}</span>`:'')}
+
+function openLabel(kind,target,cur={}){
+ $('#dtitle').textContent=`Label ${kind}: ${target}`;
+ $('#d_label').value=cur.label||'';$('#d_color').value=cur.color||'#4fa3ff';
+ $('#d_policy').value=cur.policy||'none';$('#d_note').value=cur.note||'';
+ $('#d_ok').onclick=async e=>{e.preventDefault();await post('/api/labels',{kind,target,label:$('#d_label').value,color:$('#d_color').value,policy:$('#d_policy').value,note:$('#d_note').value});$('#dlg').close();refresh()};
+ $('#d_del').onclick=async()=>{await api(`/api/labels?${qs({kind,target})}`,{method:'DELETE'});$('#dlg').close();refresh()};
+ $('#dlg').showModal();}
+const findLabel=(k,t)=>labels.find(l=>l.kind==k&&l.target==t)||{};
+
+function th(cols,st=S){return '<tr>'+cols.map(([k,n])=>`<th data-k="${k||''}" class="${st.sort==k?'s':''}" data-d="${st.dir=='asc'?' ▲':' ▼'}">${n}</th>`).join('')+'</tr>'}
+function bindSort(st=S){document.querySelectorAll('th[data-k]').forEach(h=>{if(!h.dataset.k)return;h.onclick=()=>{if(st.sort==h.dataset.k)st.dir=st.dir=='asc'?'desc':'asc';else{st.sort=h.dataset.k;st.dir='desc'}refresh()}})}
+
+async function drawConnections(){
+ const rows=await api('/api/connections?'+qs({...F,...S}));
+ const labelNames=[...new Set(labels.map(l=>l.label).filter(Boolean))];
+ $('#view').innerHTML=`<div class="card">
+  <div class="bar">
+   <input type="search" id="f_q" placeholder="Search app, IP, port, label, note…" value="${esc(F.q)}">
+   <select id="f_active"><option value="1">Active now</option><option value="">All history</option></select>
+   <select id="f_proto"><option value="">any protocol</option><option value="tcp">tcp</option><option value="udp">udp (non-QUIC)</option><option value="quic">quic (udp 443)</option></select>
+   <select id="f_ipv"><option value="">IPv4 + IPv6</option><option value="4">IPv4 only</option><option value="6">IPv6 only</option></select>
+   <select id="f_remote"><option value="">all remotes</option><option value="public">public only</option></select>
+   <select id="f_label"><option value="">any label</option><option value="labelled">labelled</option><option value="unlabelled">unlabelled</option>${labelNames.map(n=>`<option>${esc(n)}</option>`).join('')}</select>
+   <select id="f_policy"><option value="">any policy</option><option>trusted</option><option>watch</option><option>block</option></select>
+   <button class="b" id="exp">Export JSON</button><span class="mut">${rows.length} rows</span>
+  </div>
+  <div class="scroll"><table>${th([['process','App'],['user','User'],['pid','PID'],['proto','Proto'],['raddr','Remote'],['rport','Port'],['status','State'],['first_seen','First seen'],['last_seen','Last seen'],['hits','Hits'],[null,'Labels']])}
+  ${rows.map(r=>`<tr><td><span class="dot ${r.active?'on':''}"></span><a href="#" data-lab="app|${esc(r.process)}">${esc(r.process)}</a></td><td>${esc(r.user)||'<span class="mut">–</span>'}</td><td>${r.pid}</td><td>${r.proto_label}${r.ipv==6?' <span class="mut">v6</span>':''}</td>
+   <td title="${esc(r.hostname)}"><a href="#" data-lab="host|${esc(r.raddr)}">${esc(r.raddr)}</a> <span class="mut">${esc(r.hostname)}</span></td>
+   <td>${r.rport}</td><td>${esc(r.status)}</td><td title="${ago(r.first_seen)}">${fdate(r.first_seen)}</td><td title="${ago(r.last_seen)}">${fdate(r.last_seen)}</td><td>${r.hits}</td>
+   <td>${lt(r.app_label,r.app_color,r.app_policy)}${lt(r.host_label,r.host_color,r.host_policy)}</td></tr>`).join('')||'<tr><td colspan=11 class="empty">No connections match.</td></tr>'}</table></div></div>`;
+ for(const k of ['active','proto','ipv','remote','label','policy'])$('#f_'+k).value=F[k];
+ const q=$('#f_q');q.oninput=()=>{F.q=q.value;clearTimeout(window._t);window._t=setTimeout(refresh,250)};
+ for(const k of ['active','proto','ipv','remote','label','policy'])$('#f_'+k).onchange=e=>{F[k]=e.target.value;refresh()};
+ $('#exp').onclick=()=>window.open('/api/export?'+qs({...F,...S}));
+ bindSort();bindLabelLinks();}
+
+function bindLabelLinks(){document.querySelectorAll('[data-lab]').forEach(a=>a.onclick=e=>{e.preventDefault();const[k,t]=a.dataset.lab.split('|');openLabel(k,t,findLabel(k,t))})}
+
+async function drawApps(){
+ const rows=await api('/api/apps');
+ $('#view').innerHTML=`<div class="card"><div class="scroll"><table>
+ <tr><th>App</th><th>Path</th><th>Active</th><th>Total conns</th><th>Remote hosts</th><th>First seen</th><th>Last seen</th><th>Label / policy</th><th></th></tr>
+ ${rows.map(r=>`<tr><td><span class="dot ${r.active?'on':''}"></span>${esc(r.process)}</td><td title="${esc(r.exe)}" class="mut">${esc(r.exe)}</td><td>${r.active}</td><td>${r.conns}</td><td>${r.hosts}</td><td>${ago(r.first_seen)}</td><td>${ago(r.last_seen)}</td>
+ <td>${lt(r.label,r.color,r.policy)} <span class="mut">${esc(r.note)}</span></td>
+ <td><button class="b" data-lab="app|${esc(r.process)}">Label</button> <button class="b" data-flt="${esc(r.process)}">Connections</button></td></tr>`).join('')||'<tr><td colspan=9 class="empty">Nothing seen yet.</td></tr>'}</table></div></div>`;
+ document.querySelectorAll('[data-flt]').forEach(b=>b.onclick=()=>{F={q:'',proto:'',ipv:'',active:'',remote:'',label:'',policy:'',process:b.dataset.flt,user:''};tab='connections';draw()});
+ bindLabelLinks();}
+
+function drawAlerts(){
+ $('#view').innerHTML=`<div class="card"><div class="bar"><button class="b" id="ackall">Mark all read</button></div><div class="scroll"><table>
+ <tr><th>When</th><th>Type</th><th>Subject</th><th>Detail</th></tr>
+ ${alerts.map(a=>`<tr style="${a.ack?'opacity:.55':''}"><td title="${ago(a.ts)}">${fdate(a.ts)}</td><td><span class="tag" style="background:${['blocked-attempt','blocked','unsigned-exe','exe-modified'].includes(a.kind)?'var(--bad)':['new-app','new-exe'].includes(a.kind)?'var(--warn)':'var(--acc)'}">${a.kind}</span></td><td>${esc(a.subject)}</td><td class="mut">${esc(a.detail)}</td></tr>`).join('')||'<tr><td colspan=4 class="empty">No alerts.</td></tr>'}</table></div></div>`;
+ $('#ackall').onclick=async()=>{await post('/api/alerts/ack',{id:0});refresh()};}
+
+function drawLabels(){
+ $('#view').innerHTML=`<div class="card"><div class="scroll"><table><tr><th>Kind</th><th>Target</th><th>Label</th><th>Policy</th><th>Note</th><th></th></tr>
+ ${labels.map(l=>`<tr><td>${l.kind}</td><td>${esc(l.target)}</td><td>${lt(l.label,l.color,'')}</td><td class="pol-${l.policy}">${l.policy}</td><td class="mut">${esc(l.note)}</td><td><button class="b" data-lab="${l.kind}|${esc(l.target)}">Edit</button></td></tr>`).join('')||'<tr><td colspan=6 class="empty">No labels yet — click an app or remote address on the Connections tab.</td></tr>'}</table></div></div>`;
+ bindLabelLinks();}
+
+
+const hbytes=n=>n>=1e9?(n/1e9).toFixed(2)+' GB':n>=1e6?(n/1e6).toFixed(1)+' MB':n>=1e3?(n/1e3).toFixed(1)+' KB':Math.round(n)+' B';
+const PAL=['#4fa3ff','#f5a623','#3ecf8e','#c678dd','#ff5d5d','#e5c07b','#56b6c2','#8a96a8'];
+async function drawUsage(){
+ const [rows,live,series,cs]=await Promise.all([api('/api/usage?'+qs(U)),api('/api/usage/live'),api('/api/usage/series?'+qs({range:U.range,proto:U.proto,ipv:U.ipv,q:U.q})),api('/api/capture')]);
+ const g=U.group, cols=[]; const hasApp=g=='app'||g=='app_port', hasPort=g=='app_port'||g=='port', hasProto=g!='app';
+ if(hasApp)cols.push(['process','App']); if(hasProto)cols.push(['proto','Proto']); if(hasPort)cols.push(['port','Port'],);
+ cols.push(['tx','↑ Sent'],['rx','↓ Received'],['total','Total'],[null,'Share']);if(hasPort)cols.push([null,'']);
+ const sum=rows.reduce((a,r)=>a+r.total,0)||1, max=Math.max(1,...rows.map(r=>r.total));
+ const banner=cs.mode=='demo'?'<div class="mut" style="margin-bottom:8px">Demo data — synthetic numbers.</div>':
+  cs.mode!='sniffer'?`<div class="card" style="border-color:var(--warn)"><b>Per-app bandwidth is off.</b> ${esc(cs.error||'')}<br><span class="mut">Linux: <code>sudo python server.py</code> (or <code>sudo setcap cap_net_raw+ep $(readlink -f $(which python3))</code>). Other OSes aren't supported yet.</span></div>`:'';
+ $('#view').innerHTML=banner+`
+ <div class="card"><div class="mut" style="margin-bottom:6px">Live (last sample)</div>
+  <table><tr><th>App</th><th>↑ Upload</th><th>↓ Download</th><th>Top ports</th></tr>
+  ${live.slice(0,8).map(a=>`<tr><td>${esc(a.process)}</td><td>${hb(Math.round(a.tx))}</td><td>${hb(Math.round(a.rx))}</td><td class="mut">${a.ports.map(esc).join(', ')}</td></tr>`).join('')||'<tr><td colspan=4 class="empty">No traffic in the last sample.</td></tr>'}</table></div>
+ <div class="card"><canvas id="ugraph" style="height:150px"></canvas><div id="ulegend" class="mut" style="margin-top:6px"></div></div>
+ <div class="card"><div class="bar">
+  <select id="u_range">${[[300,'Last 5 min'],[3600,'Last hour'],[86400,'Last 24 h'],[604800,'Last 7 days'],[2592000,'Last 30 days']].map(([v,n])=>`<option value="${v}">${n}</option>`).join('')}</select>
+  <select id="u_group"><option value="app_port">By app + protocol + port</option><option value="app">By app</option><option value="port">By protocol + port</option><option value="proto">By protocol</option></select>
+  <select id="u_proto"><option value="">any protocol</option><option value="tcp">tcp</option><option value="udp">udp (non-QUIC)</option><option value="quic">quic (udp 443)</option><option value="icmp">icmp</option></select>
+  <select id="u_ipv"><option value="">IPv4 + IPv6</option><option value="4">IPv4 only</option><option value="6">IPv6 only</option></select>
+  <input type="search" id="u_q" placeholder="Filter app / port…" value="${esc(U.q)}">
+  <span class="mut">${rows.length} rows · ${hbytes(sum)} total</span></div>
+  <div class="scroll"><table>${th(cols,U)}
+  ${rows.map(r=>`<tr>${hasApp?`<td>${r.process=='(unattributed)'?`<span class="mut" title="Socket closed before it could be matched to a process">${esc(r.process)}</span>`:`<a href="#" data-lab="app|${esc(r.process)}">${esc(r.process)}</a>`}</td>`:''}${hasProto?`<td>${r.proto}</td>`:''}${hasPort?`<td>${r.port||'–'} <span class="mut">${esc(r.service||'')}</span></td>`:''}
+   <td>${hbytes(r.tx)}</td><td>${hbytes(r.rx)}</td><td>${hbytes(r.total)}</td>
+   <td style="width:140px"><div style="background:var(--acc);height:6px;border-radius:3px;width:${(r.total/max*100).toFixed(1)}%"></div></td>${hasPort?`<td>${r.port?`<a href="#" data-blockport="${r.proto}|${r.port}">Block port</a>`:''}</td>`:''}</tr>`).join('')||`<tr><td colspan=9 class="empty">No usage recorded in this range.</td></tr>`}</table></div></div>`;
+ $('#u_range').value=U.range;$('#u_group').value=U.group;$('#u_proto').value=U.proto;$('#u_ipv').value=U.ipv;
+ for(const[k,id]of[['range','u_range'],['group','u_group'],['proto','u_proto'],['ipv','u_ipv']])$('#'+id).onchange=e=>{U[k]=e.target.value;refresh()};
+ const q=$('#u_q');q.oninput=()=>{U.q=q.value;clearTimeout(window._t);window._t=setTimeout(refresh,250)};
+ bindSort(U);bindLabelLinks();bindBlockLinks();drawUsageChart(series);}
+function drawUsageChart(sr){
+ const c=$('#ugraph'),dpr=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;
+ const g=c.getContext('2d');g.scale(dpr,dpr);const cs=getComputedStyle(document.body),mut=cs.getPropertyValue('--mut');
+ const col=a=>PAL[Math.min(sr.apps.indexOf(a),PAL.length-1)];
+ $('#ulegend').innerHTML=sr.apps.map(a=>`<span style="margin-right:12px"><span class="dot" style="background:${col(a)}"></span>${esc(a)}</span>`).join('');
+ if(!sr.points.length){g.fillStyle=mut;g.fillText('no usage recorded in this range',10,20);return}
+ const T0=Date.now()/1000-U.range, bw=Math.max(2,(w-60)/(U.range/sr.step)-1);
+ const tot=sr.points.map(p=>Object.values(p.v).reduce((a,b)=>a+b,0)), max=Math.max(1,...tot)*1.1;
+ g.fillStyle=mut;g.font='11px system-ui';g.fillText(hbytes(max/1.1)+' / '+(sr.step>=3600?'h':sr.step>=600?'10 min':'min'),2,12);
+ const X=t=>50+(t-T0)/U.range*(w-60), Y=v=>h-4-(v/max)*(h-20);
+ for(const p of sr.points){let acc=0;for(const a of sr.apps){const v=p.v[a]||0;if(!v)continue;g.fillStyle=col(a);g.fillRect(X(p.t),Y(acc+v),bw,Y(acc)-Y(acc+v));acc+=v}}}
+
+const fdate=t=>new Date(t*1000).toLocaleString([], {year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const sigCell=r=>r.status=='pending'?'<span class="mut">checking…</span>':r.signed?'<span style="color:var(--ok)" title="'+esc(r.verified_by)+'">✔ yes</span>':'<span style="color:var(--bad)" title="'+esc(r.verified_by)+'">✖ no</span>';
+
+async function drawLog(){
+ const rows=await api('/api/executables?'+qs(L));
+ const all=await api('/api/executables');
+ const day=Date.now()/1000-86400;
+ $('#view').innerHTML=`<div class="card stats">
+   <div><b>${all.length}</b><span class="mut">executables seen</span></div>
+   <div><b style="color:var(--bad)">${all.filter(r=>r.status=='done'&&!r.signed).length}</b><span class="mut">unsigned / unverified</span></div>
+   <div><b>${all.filter(r=>r.first_run>day&&!r.baseline).length}</b><span class="mut">new in last 24 h</span></div>
+   <div><b style="color:var(--warn)">${all.filter(r=>r.risky).length}</b><span class="mut">from temp/downloads</span></div></div>
+  <div class="card"><div class="bar">
+   <input type="search" id="l_q" placeholder="Search filename, path, publisher, hash, user…" value="${esc(L.q)}">
+   <select id="l_signed"><option value="">signed: any</option><option value="yes">signed: yes</option><option value="no">signed: no</option><option value="pending">still checking</option></select>
+   <select id="l_since"><option value="">first run: any time</option><option value="3600">last hour</option><option value="86400">last 24 h</option><option value="604800">last 7 days</option></select>
+   <select id="l_risky"><option value="">any location</option><option value="1">temp / downloads only</option></select>
+   <select id="l_baseline"><option value="">incl. already running at start</option><option value="0">only seen starting while watching</option></select>
+   <a class="b" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px" href="/api/executables.csv?${qs(L)}">Export CSV</a>
+   <span class="mut">${rows.length} rows</span></div>
+  <div class="scroll"><table>${th([['filename','Filename'],['path','Path'],['first_run','First run (time)'],['user','First run by'],['publisher','Publisher'],['signed','Signed'],['runs','Runs'],['last_run','Last run (time)'],['last_user','Last run by'],[null,'SHA-256'],[null,'Flags'],[null,'']],L)}
+  ${rows.map(r=>`<tr><td><a href="#" data-runs="${esc(r.path)}" title="Show every run"><b>${esc(r.filename)}</b></a></td><td title="${esc(r.path)}">${esc(r.path)}</td>
+   <td title="${r.baseline?'Already running when NetWatch started; this is that process\'s start time, earlier runs are unknown':''}">${fdate(r.first_run)}${r.baseline?' <span class="mut">*</span>':''}</td><td>${esc(r.user)||'<span class="mut">–</span>'}</td>
+   <td>${esc(r.publisher)||'<span class="mut">–</span>'}</td><td>${sigCell(r)}</td><td>${r.runs}</td><td title="${ago(r.last_run)}">${fdate(r.last_run)}</td><td>${esc(r.last_user)||'<span class="mut">–</span>'}</td>
+   <td class="mut" title="${esc(r.sha256)}">${esc(r.sha256.slice(0,12))}</td>
+   <td>${r.risky?'<span class="tag" style="background:var(--warn)">temp/downloads</span>':''}${r.modified?'<span class="tag" style="background:var(--bad)">modified</span>':''}</td>
+   <td><button class="b" data-blockpath="${esc(r.path)}">Block</button></td></tr>`).join('')||'<tr><td colspan=12 class="empty">Nothing matches. Executables are recorded the first time a process starts from them.</td></tr>'}</table></div>
+  <div class="mut" style="margin-top:8px">* already running when NetWatch started. “Signed”: Windows = valid Authenticode signature, macOS = valid codesign, Linux = file belongs to a dpkg/rpm package and still matches its checksum (hover for details).</div></div>`;
+ for(const k of ['signed','since','risky','baseline'])$('#l_'+k).value=L[k];
+ const q=$('#l_q');q.oninput=()=>{L.q=q.value;clearTimeout(window._t);window._t=setTimeout(refresh,250)};
+ for(const k of ['signed','since','risky','baseline'])$('#l_'+k).onchange=e=>{L[k]=e.target.value;refresh()};
+ bindSort(L);bindBlockLinks();
+ document.querySelectorAll('[data-runs]').forEach(a=>a.onclick=async e=>{e.preventDefault();const p=a.dataset.runs,runs=await api('/api/executables/runs?path='+encodeURIComponent(p));
+  $('#rtitle').textContent=p;$('#rbody').innerHTML=runs.map(r=>`<tr><td>${fdate(r.ts)}</td><td>${esc(r.user)||'–'}</td><td>${r.pid}</td></tr>`).join('')||'<tr><td colspan=3 class="empty">No runs recorded.</td></tr>';$('#rdlg').showModal()})}
+
+function goRule(pre){PRE=pre;tab='protect';draw()}
+function bindBlockLinks(){
+ document.querySelectorAll('[data-blockpath]').forEach(b=>b.onclick=e=>{e.preventDefault();goRule({kind:'path',path:b.dataset.blockpath})});
+ document.querySelectorAll('[data-blockport]').forEach(b=>b.onclick=e=>{e.preventDefault();const[p,n]=b.dataset.blockport.split('|');goRule({kind:'port',proto:p=='icmp'?'any':p,port:n})});}
+
+function protectForm(){
+ return `<div class="card" id="pf"><b>Add a rule</b>
+  <div class="bar" style="margin-top:8px">
+   <select id="r_kind"><option value="port">Block a port</option><option value="protocol">Block a protocol</option><option value="path">Block a program / folder</option></select>
+   <select id="r_proto"></select>
+   <input id="r_port" placeholder="ports e.g. 25 or 80,443 or 8000-8100">
+   <input id="r_path" placeholder="/usr/bin/app  ·  /tmp/ (folder)  ·  C:\\Tools\\app.exe" style="min-width:320px">
+   <select id="r_dir"><option value="both">in + out</option><option value="out">outbound only</option><option value="in">inbound only</option></select>
+   <input id="r_note" placeholder="note (optional)">
+   <button class="b" id="r_add">Add &amp; enforce</button></div>
+  <div class="mut" id="r_help"></div></div>
+  <div id="pstatus"></div><div class="card"><div class="scroll" id="prules"></div></div>`;}
+
+function syncRuleForm(){
+ const k=$('#r_kind').value;
+ $('#r_proto').style.display=k=='path'?'none':'';$('#r_port').style.display=k=='port'?'':'none';$('#r_path').style.display=k=='path'?'':'none';
+ const opts=k=='protocol'?['tcp','udp','quic','icmp']:['any','tcp','udp'];
+ const cur=$('#r_proto').value;$('#r_proto').innerHTML=opts.map(o=>`<option value="${o}">${o=='any'?'tcp + udp':o=='icmp'?'icmp (ping)':o=='quic'?'quic / HTTP3 (udp 443)':o}</option>`).join('');if(opts.includes(cur))$('#r_proto').value=cur;
+ $('#r_help').textContent=({port:'Port rules: outbound = connections to that remote port; inbound = connections to that local port.',
+  protocol:'Protocol rules block everything of that type (loopback is exempt for tcp/udp). QUIC blocks UDP 443 so browsers fall back to TCP. ICMP blocks ping only.',
+  path:'Program rules: exact file, a folder (ends with / or \\), or a wildcard like /home/*/Downloads/*. Linux enforces by dropping the local ports the program currently owns, so a brand-new connection may leak its first packets.'})[k];}
+
+async function drawProtect(){
+ if(!$('#pf')){$('#view').innerHTML=protectForm();
+  $('#r_kind').onchange=syncRuleForm;syncRuleForm();
+  $('#r_add').onclick=async()=>{
+   const body={kind:$('#r_kind').value,proto:$('#r_proto').value,port:$('#r_port').value,path:$('#r_path').value,direction:$('#r_dir').value,note:$('#r_note').value};
+   let r=await fetch('/api/protect/rules',{method:'POST',body:JSON.stringify(body)});
+   if(r.status==409){const j=await r.json();if(!confirm(j.confirm+'.\n\nAdd the rule anyway?'))return;r=await fetch('/api/protect/rules',{method:'POST',body:JSON.stringify({...body,confirm:true})})}
+   const j=await r.json();if(j.error){alert(j.error);return}if(j.warning)alert('Saved, but the firewall reported: '+j.warning);
+   $('#r_port').value='';$('#r_path').value='';$('#r_note').value='';refresh();};
+  if(PRE){$('#r_kind').value=PRE.kind;syncRuleForm();if(PRE.proto)$('#r_proto').value=PRE.proto;$('#r_port').value=PRE.port||'';$('#r_path').value=PRE.path||'';PRE=null;
+   ($('#r_path').style.display?$('#r_port'):$('#r_path')).scrollIntoView({block:'center'})}}
+ const d=await api('/api/protect');
+ $('#pstatus').innerHTML=(d.backend?`<div class="card bar" style="justify-content:space-between"><span>Enforcement: <b>${d.backend}</b> — protection is <b style="color:var(${d.enabled?'--ok':'--warn'})">${d.enabled?'ON':'PAUSED'}</b>. Rules are removed when NetWatch exits.</span>
+   <button class="b" id="master">${d.enabled?'Pause all rules':'Resume protection'}</button></div>`:
+   `<div class="card" style="border-color:var(--warn)"><b>Rules are saved but not enforced.</b> ${esc(d.error||'')}</div>`)+(d.backend&&d.error?`<div class="card" style="border-color:var(--bad)">Firewall error: ${esc(d.error)}</div>`:'');
+ if($('#master'))$('#master').onclick=async()=>{await post('/api/protect/master',{enabled:!d.enabled});refresh()};
+ $('#prules').innerHTML=`<table><tr><th>#</th><th>Type</th><th>Rule</th><th>Note</th><th>Dropped</th><th>On</th><th></th></tr>
+  ${d.rules.map(r=>`<tr><td>${r.id}</td><td>${r.kind}</td><td title="${esc(r.summary)}">${esc(r.summary)}${r.matched_ports!=null?` <span class="mut">(${r.matched_ports} socket port${r.matched_ports==1?'':'s'} matched now)</span>`:''}</td>
+   <td class="mut">${esc(r.note)}</td><td>${r.packets?r.packets+' pkts · '+hbytes(r.bytes):'<span class="mut">0</span>'}</td>
+   <td><input type="checkbox" data-tog="${r.id}" ${r.enabled?'checked':''}></td><td><button class="b" data-delr="${r.id}">Delete</button></td></tr>`).join('')||'<tr><td colspan=7 class="empty">No rules yet.</td></tr>'}</table>`;
+ document.querySelectorAll('[data-tog]').forEach(c=>c.onchange=async()=>{await post('/api/protect/toggle',{id:+c.dataset.tog,enabled:c.checked});refresh()});
+ document.querySelectorAll('[data-delr]').forEach(b=>b.onclick=async()=>{if(confirm('Delete rule #'+b.dataset.delr+'?')){await api('/api/protect/rules?id='+b.dataset.delr,{method:'DELETE'});refresh()}});}
+
+let WIDTHS={};try{WIDTHS=JSON.parse(localStorage.getItem('nw.colw')||'{}')}catch(e){}
+const saveW=()=>{try{localStorage.setItem('nw.colw',JSON.stringify(WIDTHS))}catch(e){}};
+const fit=t=>{t.style.width=[...t.querySelectorAll('tr:first-child th')].reduce((a,h)=>a+parseFloat(h.style.width||0),0)+'px'};
+function enhance(){
+ document.querySelectorAll('#view table').forEach((t,ti)=>{
+  const ths=[...t.querySelectorAll('tr:first-child th')];if(!ths.length||t.classList.contains('rs'))return;
+  const nat=ths.map(h=>h.getBoundingClientRect().width);          // natural widths, measured before fixing the layout
+  t.classList.add('rs');
+  ths.forEach((h,i)=>{
+   const id=tab+':'+ti+':'+(h.textContent.trim()||i);
+   h.style.width=(WIDTHS[id]||Math.min(Math.max(nat[i],56),380))+'px';
+   const g=document.createElement('span');g.className='rh';g.title='Drag to resize · double-click to reset';h.appendChild(g);
+   g.onclick=e=>e.stopPropagation();
+   g.ondblclick=()=>{delete WIDTHS[id];saveW();window._drag=false;draw()};
+   g.onpointerdown=e=>{e.preventDefault();e.stopPropagation();g.setPointerCapture(e.pointerId);g.classList.add('on');window._drag=true;
+    const x0=e.clientX,w0=h.getBoundingClientRect().width;
+    g.onpointermove=ev=>{h.style.width=Math.max(40,w0+ev.clientX-x0)+'px';fit(t)};
+    g.onpointerup=()=>{g.onpointermove=g.onpointerup=null;g.classList.remove('on');WIDTHS[id]=parseFloat(h.style.width);saveW();setTimeout(()=>window._drag=false,100)}};
+  });fit(t)});}
+
+function drawGraph(){
+ const c=$('#graph'),dpr=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;
+ const g=c.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,w,h);
+ const cs=getComputedStyle(document.body);
+ if(traffic.length<2){g.fillStyle=cs.getPropertyValue('--mut');g.fillText('collecting traffic…',10,20);return}
+ const max=Math.max(1000,...traffic.map(t=>Math.max(t[1],t[2])))*1.1,t0=traffic[0][0],t1=traffic[traffic.length-1][0];
+ const X=t=>(t-t0)/Math.max(1,t1-t0)*(w-60)+50, Y=v=>h-18-(v/max)*(h-30);
+ g.strokeStyle=cs.getPropertyValue('--line');g.fillStyle=cs.getPropertyValue('--mut');g.font='11px system-ui';
+ for(let i=0;i<=3;i++){const v=max*i/3;g.beginPath();g.moveTo(50,Y(v));g.lineTo(w-10,Y(v));g.stroke();g.fillText(hb(Math.round(v)),2,Y(v)+3)}
+ for(const[i,col]of[[2,'#4fa3ff'],[1,'#f5a623']]){g.beginPath();g.moveTo(X(t0),Y(0));traffic.forEach(t=>g.lineTo(X(t[0]),Y(t[i])));g.lineTo(X(t1),Y(0));g.closePath();
+  g.fillStyle=col+'33';g.fill();g.strokeStyle=col;g.beginPath();traffic.forEach((t,k)=>k?g.lineTo(X(t[0]),Y(t[i])):g.moveTo(X(t[0]),Y(t[i])));g.stroke()}
+ g.fillStyle='#4fa3ff';g.fillText('● download',60,10);g.fillStyle='#f5a623';g.fillText('● upload',140,10);}
+
+const VIEWS=()=>({connections:drawConnections,usage:drawUsage,log:drawLog,protect:drawProtect,apps:drawApps,alerts:drawAlerts,labels:drawLabels});
+function draw(){$('#view').innerHTML='';renderNav();Promise.resolve(VIEWS()[tab]()).then(enhance)}
+let busy=false;
+async function refresh(){
+ if(busy||window._drag||$('#dlg').open||$('#rdlg').open)return;busy=true;
+ try{[labels,alerts,traffic]=await Promise.all([api('/api/labels'),api('/api/alerts'),api('/api/traffic')]);
+  const last=traffic[traffic.length-1]||[0,0,0];
+  const apps=await api('/api/apps');
+  $('#stats').innerHTML=`<div><b>${hb(last[2])}</b><span class="mut">download</span></div><div><b>${hb(last[1])}</b><span class="mut">upload</span></div><div><b>${apps.reduce((a,r)=>a+(r.active||0),0)}</b><span class="mut">active connections</span></div><div><b>${apps.length}</b><span class="mut">apps seen</span></div><div><b>${alerts.filter(a=>!a.ack).length}</b><span class="mut">unread alerts</span></div>`;
+  $('#clock').textContent=new Date().toLocaleTimeString();
+  drawGraph();
+  const keep=/^(f|u|l)_q$/.test(document.activeElement?.id)?[document.activeElement.id,document.activeElement.selectionStart]:null;
+  await Promise.resolve(VIEWS()[tab]());enhance();renderNav();
+  if(keep){const q=$('#'+keep[0]);q.focus();q.setSelectionRange(keep[1],keep[1])}
+ }finally{busy=false}}
+refresh();setInterval(refresh,3000);addEventListener('resize',drawGraph);
+</script>
+</body></html>
