@@ -14,6 +14,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import psutil
+import capture
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "netwatch.db")
@@ -32,6 +33,11 @@ CREATE TABLE IF NOT EXISTS labels(
   kind TEXT, target TEXT, label TEXT DEFAULT '', color TEXT DEFAULT '',
   policy TEXT DEFAULT 'none', note TEXT DEFAULT '',
   PRIMARY KEY(kind, target));           -- kind: app | host
+CREATE TABLE IF NOT EXISTS usage(
+  bucket INTEGER, process TEXT, proto TEXT, port INTEGER,
+  tx INTEGER DEFAULT 0, rx INTEGER DEFAULT 0,
+  PRIMARY KEY(bucket, process, proto, port));   -- 1-minute buckets, service port
+CREATE INDEX IF NOT EXISTS usage_bucket ON usage(bucket);
 CREATE TABLE IF NOT EXISTS alerts(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, subject TEXT,
   detail TEXT, ack INTEGER DEFAULT 0);
@@ -41,6 +47,14 @@ traffic = []          # [(ts, bytes_sent_per_s, bytes_recv_per_s)]
 rdns_cache = {}       # ip -> hostname or ""
 rdns_pending = set()
 DEMO = False
+cap = None                 # capture.Capture when live capture is active
+owners = {}                # (proto, local_port) -> (process, last_seen)
+listen_ports = set()       # (proto, local_port) of listening sockets
+live_rates = {}            # (process, proto, port) -> (tx_Bps, rx_Bps) over the last interval
+pending_flows = {}         # flows whose socket owner was not found yet (retried once)
+UNATTRIBUTED = "(unattributed)"
+USAGE_KEEP_DAYS = 30
+OWNER_TTL = 120
 
 
 # ---------------------------------------------------------------- helpers
@@ -80,9 +94,9 @@ def snapshot_real():
         conns = psutil.net_connections(kind="inet")
     except psutil.AccessDenied:
         conns = []
+    now = time.time()
+    lp = set()
     for c in conns:
-        if not c.raddr:      # skip pure listeners; they have no remote peer
-            continue
         pid = c.pid or 0
         if pid not in procs:
             try:
@@ -91,10 +105,20 @@ def snapshot_real():
             except Exception:
                 procs[pid] = ("unknown", "")
         name, exe = procs[pid]
+        if c.laddr and pid:
+            k = ("tcp" if c.type == socket.SOCK_STREAM else "udp", c.laddr.port)
+            owners[k] = (name, now)
+            if c.status == "LISTEN":
+                lp.add(k)
+        if not c.raddr:      # skip pure listeners; they have no remote peer
+            continue
         rows.append(dict(process=name, exe=exe, pid=pid,
                          proto="tcp" if c.type == socket.SOCK_STREAM else "udp",
                          laddr=c.laddr.ip, lport=c.laddr.port,
                          raddr=c.raddr.ip, rport=c.raddr.port, status=c.status))
+    listen_ports.clear(); listen_ports.update(lp)
+    for k in [k for k, v in owners.items() if now - v[1] > OWNER_TTL]:
+        del owners[k]
     return rows
 
 
@@ -121,14 +145,83 @@ def snapshot_demo():
     return list(_demo_state)
 
 
+def service_port(proto, lport, rport):
+    """The port that identifies the service: the listening port for inbound
+    traffic, otherwise the remote port (local ports are ephemeral)."""
+    if proto == "icmp":
+        return 0
+    if (proto, lport) in listen_ports:
+        return lport
+    if proto == "udp" and lport < 1024 <= rport:
+        return lport
+    return rport
+
+
+def ingest_usage(items, now, dt):
+    """items: [(process, proto, port, tx_bytes, rx_bytes)] accumulated over dt seconds."""
+    bucket = int(now // 60) * 60
+    live_rates.clear()
+    with db_lock:
+        for process, proto, port, tx, rx in items:
+            if not (tx or rx):
+                continue
+            db.execute("""INSERT INTO usage(bucket,process,proto,port,tx,rx) VALUES(?,?,?,?,?,?)
+                          ON CONFLICT(bucket,process,proto,port) DO UPDATE SET tx=tx+excluded.tx, rx=rx+excluded.rx""",
+                       (bucket, process, proto, port, int(tx), int(rx)))
+            k = (process, proto, port)
+            t0, r0 = live_rates.get(k, (0, 0))
+            live_rates[k] = (t0 + tx / dt, r0 + rx / dt)
+        db.commit()
+
+
+def drain_capture(now, dt):
+    """Resolve captured flows to processes and store them."""
+    flows = cap.drain()
+    flows.update({k: [a + b for a, b in zip(flows.get(k, [0, 0]), v)] for k, v in pending_flows.items()})
+    retry, agg = {}, {}
+    for (proto, lport, raddr, rport), (tx, rx) in flows.items():
+        owner = owners.get((proto, lport))
+        if owner is None and proto != "icmp":
+            if (proto, lport, raddr, rport) not in pending_flows:    # one retry on the next sample
+                retry[(proto, lport, raddr, rport)] = [tx, rx]
+                continue
+        name = owner[0] if owner else UNATTRIBUTED
+        k = (name, proto, service_port(proto, lport, rport))
+        a = agg.setdefault(k, [0, 0]); a[0] += tx; a[1] += rx
+    pending_flows.clear(); pending_flows.update(retry)
+    ingest_usage([(n, p, port, t, r) for (n, p, port), (t, r) in agg.items()], now, dt)
+
+
+def demo_usage(rows, now, dt):
+    items = []
+    for r in rows:
+        heavy = r["process"] in ("firefox", "unknown-miner")
+        rx = random.randint(2_000, 400_000 if heavy else 40_000) * dt
+        tx = random.randint(500, 60_000 if heavy else 8_000) * dt
+        items.append((r["process"], r["proto"], r["rport"], tx, rx))
+    ingest_usage(items, now, dt)
+
+
 def sample_loop():
     last = None
     seen_apps = {r["target"] for r in db.execute("SELECT DISTINCT process AS target FROM connections")}
     seen_hosts = {r["target"] for r in db.execute("SELECT DISTINCT raddr AS target FROM connections")}
     prev_io = None
+    last_t = time.time() - SAMPLE_SECS
+    last_prune = 0
     while True:
         now = time.time()
+        dt = max(now - last_t, 0.001); last_t = now
         rows = snapshot_demo() if DEMO else snapshot_real()
+        if DEMO:
+            demo_usage(rows, now, dt)
+        elif cap and cap.running:
+            drain_capture(now, dt)
+        if now - last_prune > 3600:
+            last_prune = now
+            with db_lock:
+                db.execute("DELETE FROM usage WHERE bucket < ?", (now - USAGE_KEEP_DAYS * 86400,))
+                db.commit()
         with db_lock:
             keys = set()
             for r in rows:
@@ -239,6 +332,88 @@ def q_labels():
         return [dict(r) for r in db.execute("SELECT * FROM labels ORDER BY label")]
 
 
+def svc_name(proto, port):
+    if not port:
+        return ""
+    try:
+        return socket.getservbyport(port, proto if proto in ("tcp", "udp") else "tcp")
+    except OSError:
+        return ""
+
+
+def q_usage(params):
+    p = lambda k, d="": (params.get(k) or [d])[0]
+    try:
+        rng = max(60, min(int(p("range", "3600")), USAGE_KEEP_DAYS * 86400))
+    except ValueError:
+        rng = 3600
+    group = {"app": ["process"], "app_port": ["process", "proto", "port"],
+             "port": ["proto", "port"], "proto": ["proto"]}.get(p("group", "app_port"), ["process", "proto", "port"])
+    where, args = ["bucket >= ?"], [time.time() - rng]
+    if p("proto"):
+        where.append("proto=?"); args.append(p("proto"))
+    if p("process"):
+        where.append("process=?"); args.append(p("process"))
+    if p("q"):
+        where.append("(process LIKE ? OR CAST(port AS TEXT) LIKE ? OR proto LIKE ?)"); args += [f"%{p('q')}%"] * 3
+    sort = p("sort", "total") if p("sort", "total") in ("process", "proto", "port", "tx", "rx", "total") else "total"
+    if sort in ("process", "proto", "port") and sort not in group:
+        sort = "total"
+    order = "ASC" if p("dir") == "asc" else "DESC"
+    sql = f"""SELECT {', '.join(group)}, SUM(tx) AS tx, SUM(rx) AS rx, SUM(tx)+SUM(rx) AS total
+              FROM usage WHERE {' AND '.join(where)} GROUP BY {', '.join(group)}
+              ORDER BY {sort} {order} LIMIT 500"""
+    with db_lock:
+        rows = [dict(r) for r in db.execute(sql, args)]
+    for r in rows:
+        if "port" in r:
+            r["service"] = svc_name(r["proto"], r["port"])
+    return rows
+
+
+def q_usage_series(params):
+    p = lambda k, d="": (params.get(k) or [d])[0]
+    try:
+        rng = max(60, min(int(p("range", "3600")), USAGE_KEEP_DAYS * 86400))
+        top = max(1, min(int(p("top", "6")), 12))
+    except ValueError:
+        rng, top = 3600, 6
+    since = time.time() - rng
+    step = 60 if rng <= 7200 else 600 if rng <= 86400 * 2 else 3600
+    with db_lock:
+        tops = [r["process"] for r in db.execute(
+            "SELECT process FROM usage WHERE bucket>=? GROUP BY process ORDER BY SUM(tx+rx) DESC LIMIT ?", (since, top))]
+        rows = db.execute("SELECT (bucket/?)*? AS b, process, SUM(tx+rx) AS n FROM usage WHERE bucket>=? GROUP BY b, process",
+                          (step, step, since)).fetchall()
+    series = {}
+    for r in rows:
+        name = r["process"] if r["process"] in tops else "other"
+        series.setdefault(r["b"], {}); series[r["b"]][name] = series[r["b"]].get(name, 0) + r["n"]
+    return {"step": step, "apps": tops + (["other"] if any("other" in v for v in series.values()) else []),
+            "points": [{"t": t, "v": v} for t, v in sorted(series.items())]}
+
+
+def q_usage_live():
+    out = {}
+    for (proc, proto, port), (tx, rx) in list(live_rates.items()):
+        a = out.setdefault(proc, {"process": proc, "tx": 0, "rx": 0, "ports": {}})
+        a["tx"] += tx; a["rx"] += rx
+        a["ports"][f"{proto}/{port}"] = a["ports"].get(f"{proto}/{port}", 0) + tx + rx
+    res = sorted(out.values(), key=lambda a: -(a["tx"] + a["rx"]))
+    for a in res:
+        a["ports"] = [k for k, _ in sorted(a["ports"].items(), key=lambda kv: -kv[1])[:4]]
+    return res
+
+
+def capture_status():
+    if DEMO:
+        return {"mode": "demo", "error": None}
+    if cap is None:
+        return {"mode": "off", "error": "capture disabled (--no-capture)"}
+    return {"mode": "sniffer" if cap.running else "unavailable", "error": cap.error,
+            "packets": cap.packets, "bytes": cap.bytes}
+
+
 def q_alerts(params):
     with db_lock:
         return [dict(r) for r in db.execute("SELECT * FROM alerts ORDER BY ts DESC LIMIT 300")]
@@ -267,6 +442,10 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/apps": return self.send_json(q_apps())
         if u.path == "/api/labels": return self.send_json(q_labels())
         if u.path == "/api/alerts": return self.send_json(q_alerts(params))
+        if u.path == "/api/usage": return self.send_json(q_usage(params))
+        if u.path == "/api/usage/series": return self.send_json(q_usage_series(params))
+        if u.path == "/api/usage/live": return self.send_json(q_usage_live())
+        if u.path == "/api/capture": return self.send_json(capture_status())
         if u.path == "/api/traffic":
             since = float((params.get("since") or [0])[0])
             return self.send_json([t for t in traffic if t[0] > since])
@@ -323,13 +502,19 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
-    global DEMO
+    global DEMO, cap
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--demo", action="store_true", help="generate synthetic traffic")
+    ap.add_argument("--no-capture", action="store_true", help="skip packet capture (no per-app bandwidth)")
+    ap.add_argument("--loopback", action="store_true", help="also count host-local (127.0.0.1) traffic")
     a = ap.parse_args()
     DEMO = a.demo
+    if not DEMO and not a.no_capture:
+        cap = capture.Capture(loopback=a.loopback)
+        if not cap.start():
+            print(f"per-app bandwidth disabled: {cap.error}")
     threading.Thread(target=sample_loop, daemon=True).start()
     print(f"NetWatch on http://{a.host}:{a.port}  ({'demo data' if DEMO else 'live data'})")
     ThreadingHTTPServer((a.host, a.port), H).serve_forever()

@@ -64,9 +64,9 @@ dialog label{display:block;margin:8px 0 2px;color:var(--mut);font-size:12px}dial
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ago=t=>{const s=Math.max(0,Date.now()/1000-t);return s<60?Math.floor(s)+'s ago':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago'};
 const hb=n=>n>=1e6?(n/1e6).toFixed(1)+' MB/s':n>=1e3?(n/1e3).toFixed(1)+' KB/s':n+' B/s';
-let tab='connections', F={q:'',proto:'',active:'1',remote:'',label:'',policy:'',process:''}, S={sort:'last_seen',dir:'desc'};
+let tab='connections', F={q:'',proto:'',active:'1',remote:'',label:'',policy:'',process:''}, S={sort:'last_seen',dir:'desc'}, U={range:3600,group:'app_port',sort:'total',dir:'desc',q:'',proto:''};
 let labels=[], alerts=[], traffic=[];
-const tabs=[['connections','Connections'],['apps','Apps'],['alerts','Alerts'],['labels','Labels']];
+const tabs=[['connections','Connections'],['usage','Usage'],['apps','Apps'],['alerts','Alerts'],['labels','Labels']];
 
 function renderNav(){const un=alerts.filter(a=>!a.ack).length;
  $('#nav').innerHTML=tabs.map(([k,n])=>`<button class="${k==tab?'on':''}" data-t="${k}">${n}${k=='alerts'&&un?`<span class="badge">${un}</span>`:''}</button>`).join('');
@@ -87,8 +87,8 @@ function openLabel(kind,target,cur={}){
  $('#dlg').showModal();}
 const findLabel=(k,t)=>labels.find(l=>l.kind==k&&l.target==t)||{};
 
-function th(cols){return '<tr>'+cols.map(([k,n])=>`<th data-k="${k||''}" class="${S.sort==k?'s':''}" data-d="${S.dir=='asc'?' ▲':' ▼'}">${n}</th>`).join('')+'</tr>'}
-function bindSort(){document.querySelectorAll('th[data-k]').forEach(h=>{if(!h.dataset.k)return;h.onclick=()=>{S=S.sort==h.dataset.k?{sort:S.sort,dir:S.dir=='asc'?'desc':'asc'}:{sort:h.dataset.k,dir:'desc'};refresh()}})}
+function th(cols,st=S){return '<tr>'+cols.map(([k,n])=>`<th data-k="${k||''}" class="${st.sort==k?'s':''}" data-d="${st.dir=='asc'?' ▲':' ▼'}">${n}</th>`).join('')+'</tr>'}
+function bindSort(st=S){document.querySelectorAll('th[data-k]').forEach(h=>{if(!h.dataset.k)return;h.onclick=()=>{if(st.sort==h.dataset.k)st.dir=st.dir=='asc'?'desc':'asc';else{st.sort=h.dataset.k;st.dir='desc'}refresh()}})}
 
 async function drawConnections(){
  const rows=await api('/api/connections?'+qs({...F,...S}));
@@ -137,6 +137,48 @@ function drawLabels(){
  ${labels.map(l=>`<tr><td>${l.kind}</td><td>${esc(l.target)}</td><td>${lt(l.label,l.color,'')}</td><td class="pol-${l.policy}">${l.policy}</td><td class="mut">${esc(l.note)}</td><td><button class="b" data-lab="${l.kind}|${esc(l.target)}">Edit</button></td></tr>`).join('')||'<tr><td colspan=6 class="empty">No labels yet — click an app or remote address on the Connections tab.</td></tr>'}</table></div></div>`;
  bindLabelLinks();}
 
+
+const hbytes=n=>n>=1e9?(n/1e9).toFixed(2)+' GB':n>=1e6?(n/1e6).toFixed(1)+' MB':n>=1e3?(n/1e3).toFixed(1)+' KB':Math.round(n)+' B';
+const PAL=['#4fa3ff','#f5a623','#3ecf8e','#c678dd','#ff5d5d','#e5c07b','#56b6c2','#8a96a8'];
+async function drawUsage(){
+ const [rows,live,series,cs]=await Promise.all([api('/api/usage?'+qs(U)),api('/api/usage/live'),api('/api/usage/series?'+qs({range:U.range})),api('/api/capture')]);
+ const g=U.group, cols=[]; const hasApp=g=='app'||g=='app_port', hasPort=g=='app_port'||g=='port', hasProto=g!='app';
+ if(hasApp)cols.push(['process','App']); if(hasProto)cols.push(['proto','Proto']); if(hasPort)cols.push(['port','Port'],);
+ cols.push(['tx','↑ Sent'],['rx','↓ Received'],['total','Total'],[null,'Share']);
+ const sum=rows.reduce((a,r)=>a+r.total,0)||1, max=Math.max(1,...rows.map(r=>r.total));
+ const banner=cs.mode=='demo'?'<div class="mut" style="margin-bottom:8px">Demo data — synthetic numbers.</div>':
+  cs.mode!='sniffer'?`<div class="card" style="border-color:var(--warn)"><b>Per-app bandwidth is off.</b> ${esc(cs.error||'')}<br><span class="mut">Linux: <code>sudo python server.py</code> (or <code>sudo setcap cap_net_raw+ep $(readlink -f $(which python3))</code>). Other OSes aren't supported yet.</span></div>`:'';
+ $('#view').innerHTML=banner+`
+ <div class="card"><div class="mut" style="margin-bottom:6px">Live (last sample)</div>
+  <table><tr><th>App</th><th>↑ Upload</th><th>↓ Download</th><th>Top ports</th></tr>
+  ${live.slice(0,8).map(a=>`<tr><td>${esc(a.process)}</td><td>${hb(Math.round(a.tx))}</td><td>${hb(Math.round(a.rx))}</td><td class="mut">${a.ports.map(esc).join(', ')}</td></tr>`).join('')||'<tr><td colspan=4 class="empty">No traffic in the last sample.</td></tr>'}</table></div>
+ <div class="card"><canvas id="ugraph" style="height:150px"></canvas><div id="ulegend" class="mut" style="margin-top:6px"></div></div>
+ <div class="card"><div class="bar">
+  <select id="u_range">${[[300,'Last 5 min'],[3600,'Last hour'],[86400,'Last 24 h'],[604800,'Last 7 days'],[2592000,'Last 30 days']].map(([v,n])=>`<option value="${v}">${n}</option>`).join('')}</select>
+  <select id="u_group"><option value="app_port">By app + protocol + port</option><option value="app">By app</option><option value="port">By protocol + port</option><option value="proto">By protocol</option></select>
+  <select id="u_proto"><option value="">tcp+udp+icmp</option><option>tcp</option><option>udp</option><option>icmp</option></select>
+  <input type="search" id="u_q" placeholder="Filter app / port…" value="${esc(U.q)}">
+  <span class="mut">${rows.length} rows · ${hbytes(sum)} total</span></div>
+  <div class="scroll"><table>${th(cols,U)}
+  ${rows.map(r=>`<tr>${hasApp?`<td>${r.process=='(unattributed)'?`<span class="mut" title="Socket closed before it could be matched to a process">${esc(r.process)}</span>`:`<a href="#" data-lab="app|${esc(r.process)}">${esc(r.process)}</a>`}</td>`:''}${hasProto?`<td>${r.proto}</td>`:''}${hasPort?`<td>${r.port||'–'} <span class="mut">${esc(r.service||'')}</span></td>`:''}
+   <td>${hbytes(r.tx)}</td><td>${hbytes(r.rx)}</td><td>${hbytes(r.total)}</td>
+   <td style="width:140px"><div style="background:var(--acc);height:6px;border-radius:3px;width:${(r.total/max*100).toFixed(1)}%"></div></td></tr>`).join('')||`<tr><td colspan=9 class="empty">No usage recorded in this range.</td></tr>`}</table></div></div>`;
+ $('#u_range').value=U.range;$('#u_group').value=U.group;$('#u_proto').value=U.proto;
+ for(const[k,id]of[['range','u_range'],['group','u_group'],['proto','u_proto']])$('#'+id).onchange=e=>{U[k]=e.target.value;refresh()};
+ const q=$('#u_q');q.oninput=()=>{U.q=q.value;clearTimeout(window._t);window._t=setTimeout(refresh,250)};
+ bindSort(U);bindLabelLinks();drawUsageChart(series);}
+function drawUsageChart(sr){
+ const c=$('#ugraph'),dpr=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;
+ const g=c.getContext('2d');g.scale(dpr,dpr);const cs=getComputedStyle(document.body),mut=cs.getPropertyValue('--mut');
+ const col=a=>PAL[Math.min(sr.apps.indexOf(a),PAL.length-1)];
+ $('#ulegend').innerHTML=sr.apps.map(a=>`<span style="margin-right:12px"><span class="dot" style="background:${col(a)}"></span>${esc(a)}</span>`).join('');
+ if(!sr.points.length){g.fillStyle=mut;g.fillText('no usage recorded in this range',10,20);return}
+ const T0=Date.now()/1000-U.range, bw=Math.max(2,(w-60)/(U.range/sr.step)-1);
+ const tot=sr.points.map(p=>Object.values(p.v).reduce((a,b)=>a+b,0)), max=Math.max(1,...tot)*1.1;
+ g.fillStyle=mut;g.font='11px system-ui';g.fillText(hbytes(max/1.1)+' / '+(sr.step>=3600?'h':sr.step>=600?'10 min':'min'),2,12);
+ const X=t=>50+(t-T0)/U.range*(w-60), Y=v=>h-4-(v/max)*(h-20);
+ for(const p of sr.points){let acc=0;for(const a of sr.apps){const v=p.v[a]||0;if(!v)continue;g.fillStyle=col(a);g.fillRect(X(p.t),Y(acc+v),bw,Y(acc)-Y(acc+v));acc+=v}}}
+
 function drawGraph(){
  const c=$('#graph'),dpr=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;
  const g=c.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,w,h);
@@ -150,7 +192,7 @@ function drawGraph(){
   g.fillStyle=col+'33';g.fill();g.strokeStyle=col;g.beginPath();traffic.forEach((t,k)=>k?g.lineTo(X(t[0]),Y(t[i])):g.moveTo(X(t[0]),Y(t[i])));g.stroke()}
  g.fillStyle='#4fa3ff';g.fillText('● download',60,10);g.fillStyle='#f5a623';g.fillText('● upload',140,10);}
 
-function draw(){renderNav();({connections:drawConnections,apps:drawApps,alerts:drawAlerts,labels:drawLabels})[tab]()}
+function draw(){renderNav();({connections:drawConnections,usage:drawUsage,apps:drawApps,alerts:drawAlerts,labels:drawLabels})[tab]()}
 let busy=false;
 async function refresh(){
  if(busy||$('#dlg').open||document.activeElement?.id=='f_q'&&false)return;busy=true;
@@ -160,9 +202,9 @@ async function refresh(){
   $('#stats').innerHTML=`<div><b>${hb(last[2])}</b><span class="mut">download</span></div><div><b>${hb(last[1])}</b><span class="mut">upload</span></div><div><b>${apps.reduce((a,r)=>a+(r.active||0),0)}</b><span class="mut">active connections</span></div><div><b>${apps.length}</b><span class="mut">apps seen</span></div><div><b>${alerts.filter(a=>!a.ack).length}</b><span class="mut">unread alerts</span></div>`;
   $('#clock').textContent=new Date().toLocaleTimeString();
   drawGraph();
-  const keep=document.activeElement?.id=='f_q'?[$('#f_q').selectionStart]:null;
-  await Promise.resolve(({connections:drawConnections,apps:drawApps,alerts:drawAlerts,labels:drawLabels})[tab]());renderNav();
-  if(keep){const q=$('#f_q');q.focus();q.setSelectionRange(keep[0],keep[0])}
+  const keep=/^(f|u)_q$/.test(document.activeElement?.id)?[document.activeElement.id,document.activeElement.selectionStart]:null;
+  await Promise.resolve(({connections:drawConnections,usage:drawUsage,apps:drawApps,alerts:drawAlerts,labels:drawLabels})[tab]());renderNav();
+  if(keep){const q=$('#'+keep[0]);q.focus();q.setSelectionRange(keep[1],keep[1])}
  }finally{busy=false}}
 refresh();setInterval(refresh,3000);addEventListener('resize',drawGraph);
 </script>
