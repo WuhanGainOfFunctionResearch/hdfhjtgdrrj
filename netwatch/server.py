@@ -9,12 +9,14 @@ Only the standard library and psutil are needed.
     python server.py            # http://127.0.0.1:8765
     python server.py --demo     # synthetic data, no privileges needed
 """
-import argparse, json, os, random, socket, sqlite3, threading, time
+import argparse, atexit, json, re, signal, sys, os, random, socket, sqlite3, threading, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import psutil
 import capture
+import inventory
+import protect
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "netwatch.db")
@@ -38,6 +40,16 @@ CREATE TABLE IF NOT EXISTS usage(
   tx INTEGER DEFAULT 0, rx INTEGER DEFAULT 0,
   PRIMARY KEY(bucket, process, proto, port));   -- 1-minute buckets, service port
 CREATE INDEX IF NOT EXISTS usage_bucket ON usage(bucket);
+CREATE TABLE IF NOT EXISTS executables(
+  path TEXT PRIMARY KEY, filename TEXT, first_run REAL, last_run REAL, runs INTEGER DEFAULT 1,
+  publisher TEXT DEFAULT '', signed INTEGER, verified_by TEXT DEFAULT '', sha256 TEXT DEFAULT '',
+  user TEXT DEFAULT '', baseline INTEGER DEFAULT 0, status TEXT DEFAULT 'pending',
+  risky INTEGER DEFAULT 0, mtime REAL, modified INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS rules(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, proto TEXT DEFAULT 'any', port TEXT DEFAULT '',
+  direction TEXT DEFAULT 'both', path TEXT DEFAULT '', enabled INTEGER DEFAULT 1,
+  note TEXT DEFAULT '', created REAL);
+CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS alerts(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, subject TEXT,
   detail TEXT, ack INTEGER DEFAULT 0);
@@ -55,6 +67,15 @@ pending_flows = {}         # flows whose socket owner was not found yet (retried
 UNATTRIBUTED = "(unattributed)"
 USAGE_KEEP_DAYS = 30
 OWNER_TTL = 120
+SCAN_SECS = 4
+RISKY_RE = re.compile(r"(/tmp/|/var/tmp/|/dev/shm/|\\temp\\|\\appdata\\local\\temp|/downloads/|\\downloads\\|\(deleted\)$)", re.I)
+exe_live = set()           # (pid, create_time) of processes seen on the previous scan
+first_scan = True
+verifier = None
+enforcer = protect.Enforcer()
+protect_rules_cache = []
+protect_on = True
+alert_state = {}           # rule id -> (last packet count, last alert time)
 
 
 # ---------------------------------------------------------------- helpers
@@ -202,6 +223,188 @@ def demo_usage(rows, now, dt):
     ingest_usage(items, now, dt)
 
 
+
+# ---------------------------------------------------------------- log analysis (executables)
+def _split_name(path):
+    return re.split(r"[\\/]", path.rstrip("\\/"))[-1]
+
+
+def on_verified(path, info):
+    with db_lock:
+        row = db.execute("SELECT baseline FROM executables WHERE path=?", (path,)).fetchone()
+        db.execute("""UPDATE executables SET publisher=?, signed=?, verified_by=?, sha256=?, status='done'
+                      WHERE path=?""", (info["publisher"], info["signed"], info["verified_by"], info["sha256"], path))
+        if row and not row["baseline"]:
+            if not info["signed"]:
+                add_alert("unsigned-exe", _split_name(path), f"first run of unsigned/unverified file {path} ({info['verified_by']})")
+            elif "MODIFIED" in info["verified_by"]:
+                add_alert("exe-modified", _split_name(path), path)
+        db.commit()
+
+
+def scan_processes(now):
+    """Record the first time each executable path is seen running."""
+    global first_scan, exe_live
+    live, new = set(), []
+    for p in psutil.process_iter(["pid", "exe", "create_time", "username"]):
+        exe = p.info.get("exe")
+        if not exe:
+            continue
+        key = (p.info["pid"], p.info["create_time"])
+        live.add(key)
+        if key not in exe_live:
+            new.append((exe, p.info["create_time"], p.info.get("username") or ""))
+    exe_live = live
+    if not new:
+        return
+    with db_lock:
+        for exe, started, user in new:
+            try:
+                st = os.stat(exe[:-10] if exe.endswith(" (deleted)") else exe)
+                mtime = st.st_mtime
+            except OSError:
+                mtime = None
+            row = db.execute("SELECT mtime FROM executables WHERE path=?", (exe,)).fetchone()
+            if row is None:
+                db.execute("""INSERT INTO executables(path,filename,first_run,last_run,user,baseline,risky,mtime)
+                              VALUES(?,?,?,?,?,?,?,?)""",
+                           (exe, _split_name(exe), started, started, user, int(first_scan),
+                            int(bool(RISKY_RE.search(exe))), mtime))
+                if not first_scan:
+                    add_alert("new-exe", _split_name(exe), f"first run from {exe}")
+                verifier.submit(exe)
+            else:
+                changed = mtime is not None and row["mtime"] is not None and abs(mtime - row["mtime"]) > 1
+                db.execute("UPDATE executables SET last_run=MAX(last_run,?), first_run=MIN(first_run,?), runs=runs+1, "
+                           "mtime=COALESCE(?,mtime), modified=modified OR ? WHERE path=?",
+                           (started, started, mtime, int(changed), exe))
+                if changed:
+                    db.execute("UPDATE executables SET status='pending' WHERE path=?", (exe,))
+                    add_alert("exe-modified", _split_name(exe), f"file changed on disk since first run: {exe}")
+                    verifier.submit(exe)
+        db.commit()
+    first_scan = False
+
+
+def q_executables(params):
+    p = lambda k: (params.get(k) or [""])[0]
+    where, args = [], []
+    if p("signed") == "yes":
+        where.append("signed=1")
+    elif p("signed") == "no":
+        where.append("signed=0 AND status='done'")
+    elif p("signed") == "pending":
+        where.append("status='pending'")
+    if p("since").isdigit():
+        where.append("first_run >= ?"); args.append(time.time() - int(p("since")))
+    if p("risky") == "1":
+        where.append("risky=1")
+    if p("baseline") == "0":
+        where.append("baseline=0")
+    if p("q"):
+        where.append("(filename LIKE ? OR path LIKE ? OR publisher LIKE ? OR sha256 LIKE ? OR user LIKE ?)")
+        args += [f"%{p('q')}%"] * 5
+    sort = p("sort") if p("sort") in ("filename", "path", "first_run", "last_run", "runs", "publisher", "signed", "user") else "first_run"
+    order = "ASC" if p("dir") == "asc" else "DESC"
+    with db_lock:
+        return [dict(r) for r in db.execute(
+            f"SELECT * FROM executables {'WHERE ' + ' AND '.join(where) if where else ''} ORDER BY {sort} {order} LIMIT 2000", args)]
+
+
+def executables_csv(params):
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["filename", "path", "first_run", "publisher", "signed", "verified_by", "sha256", "runs", "last_run", "user"])
+    for r in q_executables(params):
+        w.writerow([r["filename"], r["path"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["first_run"])),
+                    r["publisher"], {1: "yes", 0: "no"}.get(r["signed"], "pending"), r["verified_by"],
+                    r["sha256"], r["runs"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["last_run"])), r["user"]])
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- net protect
+def load_rules():
+    global protect_rules_cache, protect_on
+    with db_lock:
+        protect_rules_cache = [dict(r) for r in db.execute("SELECT * FROM rules ORDER BY id")]
+        m = db.execute("SELECT v FROM settings WHERE k='protect_on'").fetchone()
+        protect_on = (m["v"] != "0") if m else True
+
+
+def reapply():
+    """Reload rules from the DB and push them to the firewall. -> error or None."""
+    load_rules()
+    with db_lock:
+        exes = [r["path"] for r in db.execute("SELECT path FROM executables")]
+    err = enforcer.apply(protect_rules_cache, protect_on, exes)
+    enforcer.error = err or (None if enforcer.backend else enforcer.error)
+    if not err:
+        enforcer.refresh_paths(protect_rules_cache if protect_on else [])
+    return err
+
+
+def protect_loop():
+    """Keeps path-rule port sets fresh and raises alerts when a rule starts dropping traffic."""
+    last_poll = 0
+    while True:
+        time.sleep(protect.REFRESH)
+        if not (protect_on and enforcer.backend and protect_rules_cache):
+            continue
+        try:
+            enforcer.refresh_paths(protect_rules_cache)
+            now = time.time()
+            if now - last_poll > 10:
+                last_poll = now
+                for rid, (pk, _) in enforcer.counters().items():
+                    prev, t = alert_state.get(rid, (0, 0))
+                    if pk > prev and now - t > 300:
+                        r = next((x for x in protect_rules_cache if x["id"] == rid), None)
+                        if r:
+                            with db_lock:
+                                add_alert("blocked", f"rule #{rid}", f"{protect.describe(r)}: {pk - prev} packets dropped")
+                                db.commit()
+                        alert_state[rid] = (pk, now)
+                    else:
+                        alert_state[rid] = (pk, t) if pk > prev else (prev, t)
+        except Exception as e:                      # never let enforcement thread die
+            enforcer.error = str(e)[:200]
+
+
+def q_protect():
+    load_rules()
+    counts = enforcer.counters()
+    rules = []
+    for r in protect_rules_cache:
+        pk, by = counts.get(r["id"], (0, 0))
+        rules.append({**r, "summary": protect.describe(r), "packets": pk, "bytes": by,
+                      "matched_ports": enforcer.matched.get(r["id"]) if r["kind"] == "path" else None})
+    return {"backend": enforcer.backend, "error": enforcer.error, "enabled": protect_on, "rules": rules,
+            "platform": sys.platform}
+
+
+def protect_add(b):
+    rule, err, warn = protect.validate(b)
+    if err:
+        return {"error": err}, 400
+    if warn and not b.get("confirm"):
+        return {"confirm": warn}, 409
+    with db_lock:
+        db.execute("INSERT INTO rules(kind,proto,port,direction,path,enabled,note,created) VALUES(?,?,?,?,?,1,?,?)",
+                   (rule["kind"], rule["proto"], rule["port"], rule["direction"], rule["path"], rule["note"], time.time()))
+        db.commit()
+    err = reapply()
+    return ({"ok": True, "warning": err} if err else {"ok": True}), 200
+
+
+def protect_change(sql, args):
+    with db_lock:
+        db.execute(sql, args)
+        db.commit()
+    err = reapply()
+    return {"ok": True, "warning": err} if err else {"ok": True}
+
+
 def sample_loop():
     last = None
     seen_apps = {r["target"] for r in db.execute("SELECT DISTINCT process AS target FROM connections")}
@@ -209,6 +412,7 @@ def sample_loop():
     prev_io = None
     last_t = time.time() - SAMPLE_SECS
     last_prune = 0
+    last_scan = 0
     while True:
         now = time.time()
         dt = max(now - last_t, 0.001); last_t = now
@@ -217,6 +421,12 @@ def sample_loop():
             demo_usage(rows, now, dt)
         elif cap and cap.running:
             drain_capture(now, dt)
+        if now - last_scan >= SCAN_SECS:
+            last_scan = now
+            try:
+                scan_processes(now)
+            except Exception as e:
+                print("process scan failed:", e)
         if now - last_prune > 3600:
             last_prune = now
             with db_lock:
@@ -442,6 +652,17 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/apps": return self.send_json(q_apps())
         if u.path == "/api/labels": return self.send_json(q_labels())
         if u.path == "/api/alerts": return self.send_json(q_alerts(params))
+        if u.path == "/api/executables": return self.send_json(q_executables(params))
+        if u.path == "/api/executables.csv":
+            data = executables_csv(params).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", "attachment; filename=netwatch-executables.csv")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if u.path == "/api/protect": return self.send_json(q_protect())
         if u.path == "/api/usage": return self.send_json(q_usage(params))
         if u.path == "/api/usage/series": return self.send_json(q_usage_series(params))
         if u.path == "/api/usage/live": return self.send_json(q_usage_live())
@@ -482,6 +703,14 @@ class H(BaseHTTPRequestHandler):
                             b.get("policy", "none"), b.get("note", "")))
                 db.commit()
             return self.send_json({"ok": True})
+        if u.path == "/api/protect/rules":
+            res, code = protect_add(b)
+            return self.send_json(res, code)
+        if u.path == "/api/protect/toggle":
+            return self.send_json(protect_change("UPDATE rules SET enabled=? WHERE id=?", (int(bool(b.get("enabled"))), int(b.get("id", 0)))))
+        if u.path == "/api/protect/master":
+            return self.send_json(protect_change("INSERT INTO settings(k,v) VALUES('protect_on',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                                                 ("1" if b.get("enabled") else "0",)))
         if u.path == "/api/alerts/ack":
             with db_lock:
                 db.execute("UPDATE alerts SET ack=1 WHERE ?=0 OR id=?", (b.get("id", 0), b.get("id", 0)))
@@ -498,6 +727,9 @@ class H(BaseHTTPRequestHandler):
                            ((q.get("kind") or [""])[0], (q.get("target") or [""])[0]))
                 db.commit()
             return self.send_json({"ok": True})
+        if u.path == "/api/protect/rules":
+            rid = (parse_qs(u.query).get("id") or ["0"])[0]
+            return self.send_json(protect_change("DELETE FROM rules WHERE id=?", (int(rid) if rid.isdigit() else 0,)))
         self.send_json({"error": "not found"}, 404)
 
 
@@ -515,6 +747,16 @@ def main():
         cap = capture.Capture(loopback=a.loopback)
         if not cap.start():
             print(f"per-app bandwidth disabled: {cap.error}")
+    global verifier
+    verifier = inventory.Verifier(on_verified)
+    err = reapply()
+    if enforcer.backend:
+        print(f"Net Protect: {enforcer.backend}, {len(protect_rules_cache)} rule(s) loaded" + (f" (warning: {err})" if err else ""))
+        atexit.register(enforcer.cleanup)                       # fail-open: rules vanish with the monitor
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    else:
+        print(f"Net Protect disabled: {enforcer.error}")
+    threading.Thread(target=protect_loop, daemon=True).start()
     threading.Thread(target=sample_loop, daemon=True).start()
     print(f"NetWatch on http://{a.host}:{a.port}  ({'demo data' if DEMO else 'live data'})")
     ThreadingHTTPServer((a.host, a.port), H).serve_forever()
