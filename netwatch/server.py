@@ -683,7 +683,8 @@ def capture_status():
     if cap is None:
         return {"mode": "off", "error": "capture disabled (--no-capture)"}
     return {"mode": "sniffer" if cap.running else "unavailable", "error": cap.error,
-            "packets": cap.packets, "bytes": cap.bytes}
+            "packets": cap.packets, "bytes": cap.bytes,
+            "note": "Windows capture counts IPv4 only; IPv6 traffic is not included." if sys.platform.startswith("win") else ""}
 
 
 def q_alerts(params):
@@ -807,7 +808,7 @@ def main():
     a = ap.parse_args()
     DEMO = a.demo
     if not DEMO and not a.no_capture:
-        cap = capture.Capture(loopback=a.loopback)
+        cap = capture.create(loopback=a.loopback)
         if not cap.start():
             print(f"per-app bandwidth disabled: {cap.error}")
     global verifier
